@@ -12,14 +12,14 @@ use crate::seccomp::notif::{read_child_mem, NotifAction};
 use crate::sys::structs::{SeccompNotif, ECONNREFUSED};
 
 use super::materialize::{
-    classify_dest_shape, materialize_msg, mmsg_entry_ptr, mmsg_msglen_addr,
+    classify_dest_shape, is_named_unix_pathname, materialize_msg, mmsg_entry_ptr, mmsg_msglen_addr,
     named_unix_socket_path, parse_ip_from_sockaddr, parse_port_from_sockaddr, ChildMsghdr,
     MaterializedMsg, MAX_SEND_BUF,
 };
 use super::send_engine::{batch_send_step, resolve_send, wants_blocking, BatchStep};
 use super::unix::{
-    mmsg_entry_named_unix_path, sendmmsg_named_unix_on_behalf, sendto_named_unix_on_behalf,
-    sendto_pinned_unix_on_behalf, unix_sendmsg_gate,
+    mmsg_entry_is_named_unix_pathname, mmsg_entry_named_unix_path, sendmmsg_named_unix_on_behalf,
+    sendto_named_unix_on_behalf, sendto_pinned_unix_on_behalf, unix_sendmsg_gate,
 };
 use super::verdict::{
     check_ip_destination, classify_send_path, path_under_any, DestShape, SendPath,
@@ -128,6 +128,13 @@ pub(super) async fn sendto_on_behalf(
                         &ctx.policy.chroot_writable,
                     )
                 }
+            }
+            // A NAMED AF_UNIX target whose `sun_path` is not valid UTF-8: fail
+            // closed rather than fall into the `_` arm below, which `Continue`s
+            // when no destination policy is active (upstream issue #143). Same
+            // reasoning as the connect gate.
+            None if ctx.policy.has_unix_fs_gate && is_named_unix_pathname(&addr_bytes) => {
+                NotifAction::Errno(libc::EACCES)
             }
             _ => {
                 // Non-IP destination with no fs-path gate: an abstract unix
@@ -461,6 +468,14 @@ pub(super) async fn sendmmsg_on_behalf(
             if mmsg_entry_named_unix_path(notif, notif_fd, entry_ptr).is_some() {
                 named_unix = true;
                 break;
+            }
+            // A named AF_UNIX entry whose `sun_path` is not valid UTF-8 returns
+            // None above, so without this it would leave `named_unix` false and
+            // let the whole batch fall through to the Continue prescan ungated
+            // (upstream issue #143). Fail the entire call closed the moment we
+            // see one — matching the chroot branch's "deny the whole call" shape.
+            if mmsg_entry_is_named_unix_pathname(notif, notif_fd, entry_ptr) {
+                return NotifAction::Errno(libc::EACCES);
             }
         }
         if named_unix {

@@ -222,6 +222,33 @@ pub(crate) fn named_unix_socket_path(addr_bytes: &[u8]) -> Option<std::path::Pat
     std::str::from_utf8(raw).ok().map(std::path::PathBuf::from)
 }
 
+/// True when `addr_bytes` is an `AF_UNIX` address carrying a pathname (not
+/// abstract, not empty) — *regardless of whether that pathname is valid UTF-8*.
+///
+/// [`named_unix_socket_path`] returns the path only when it *also* decodes as
+/// UTF-8, so a `None` from it conflates two very different cases: "not a named
+/// unix socket at all" (abstract / unnamed / non-`AF_UNIX`) and "a named unix
+/// socket whose `sun_path` bytes are not valid UTF-8". The fs gate must fail
+/// closed on the second — a non-UTF-8 `sun_path` must not slip past the gate as
+/// if it were abstract and reach the socket ungated — so the gate sites use
+/// this to tell a genuinely un-gateable address apart from one they simply
+/// cannot render.
+pub(crate) fn is_named_unix_pathname(addr_bytes: &[u8]) -> bool {
+    if addr_bytes.len() < 3 {
+        return false;
+    }
+    let family = u16::from_ne_bytes([addr_bytes[0], addr_bytes[1]]);
+    if family != libc::AF_UNIX as u16 {
+        return false;
+    }
+    let sun_path = &addr_bytes[2..];
+    if sun_path[0] == 0 {
+        return false; // abstract namespace (Landlock scope handles it)
+    }
+    let end = sun_path.iter().position(|&b| b == 0).unwrap_or(sun_path.len());
+    !sun_path[..end].is_empty()
+}
+
 /// Classify a raw destination `sockaddr` into the [`DestShape`] the non-IP send
 /// arms key off. Pure function of the already-copied bytes: no child state is
 /// re-read, so the shape cannot change after the decision.
