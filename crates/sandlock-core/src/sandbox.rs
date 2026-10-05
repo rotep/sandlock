@@ -1812,6 +1812,11 @@ impl Sandbox {
             return Err(SandboxRuntimeError::Child("empty command".into()).into());
         }
 
+        // Reject an environment the child could not be given before anything
+        // with side effects runs (DNS, the proxy, the COW branch). The child's
+        // environment itself is built right before fork, below.
+        context::ChildEnv::validate(self).map_err(SandboxRuntimeError::Child)?;
+
         // Resolve the chroot root eagerly, before any fork or confinement work:
         // a configured-but-missing chroot must be a hard error, never a silent
         // drop to "no confinement".
@@ -1987,6 +1992,10 @@ impl Sandbox {
         let foreground = stdio.all_inherit();
         let tty_foreground_taken = foreground && unsafe { libc::isatty(0) } == 1;
 
+        // The child's environment is built here, in the parent: the child must
+        // not touch `std::env` between fork and exec (see `context::ChildEnv`).
+        let child_env = context::ChildEnv::build(self).map_err(SandboxRuntimeError::Child)?;
+
         // Claim before fork so a name collision leaves no child to reap.
         let sandbox_name = self.rt().name.clone();
         let mut control_socket = match crate::control::bind_control_socket(&sandbox_name) {
@@ -2093,6 +2102,7 @@ impl Sandbox {
             };
             context::confine_child(context::ChildSpawnArgs {
                 sandbox: self,
+                env: &child_env,
                 entry,
                 pipes: &pipes,
                 no_supervisor,
@@ -2105,6 +2115,7 @@ impl Sandbox {
         }
 
         // ===== PARENT PROCESS =====
+        drop(child_env);
         drop(pipes.notif_w);
         drop(pipes.ready_r);
 

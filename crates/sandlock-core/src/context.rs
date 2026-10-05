@@ -1,7 +1,8 @@
 // Fork + confinement sequence: child-side Landlock + seccomp application
 // and parent-child pipe synchronization.
 
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsString};
+use std::os::unix::ffi::OsStringExt;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
@@ -193,6 +194,169 @@ fn write_id_maps(
 }
 
 // ============================================================
+// Child environment (built in the parent, before fork)
+// ============================================================
+
+extern "C" {
+    /// The C library's `environ`: what `execvp`, `getenv` and `execveat`
+    /// (below) read in the child.
+    static mut environ: *const *const libc::c_char;
+}
+
+/// The environment `confine_child` installs before its terminal action.
+///
+/// Built in the parent, before `fork`, because the child must not go through
+/// `std::env` (`vars_os`, `set_var`, `remove_var`): those take std's
+/// process-wide environment lock, and a `fork` taken while another thread of
+/// the parent holds it (any `std::env::var`, or a `std::process::Command`
+/// spawn) leaves it held forever in the single-threaded child, which then
+/// blocks before it ever execs. This is what `std::process::Command` does for
+/// a modified environment: the parent applies the changes to a snapshot of its
+/// own environment and the child only receives a ready `KEY=VALUE` array. The
+/// child stores the array in `environ`, which takes no lock, and keeps using
+/// `execvp`, so `PATH` lookup (also inside a chroot), the `/bin/sh` fallback
+/// for a script without a shebang, the default search path when `PATH` is
+/// unset, and the in-process entry all see the environment as before.
+pub(crate) enum ChildEnv {
+    /// Nothing to change: the child keeps the environment it inherited.
+    Inherit,
+    /// The child's whole environment.
+    Replace {
+        /// Owns the `KEY=VALUE` strings `ptrs` points into.
+        _entries: Vec<CString>,
+        /// Pointers into `_entries`, NULL-terminated as `environ` must be.
+        ptrs: Vec<*const libc::c_char>,
+    },
+}
+
+impl ChildEnv {
+    /// Reject a name or value that `set_var`/`remove_var` would have panicked
+    /// on in the child: an empty name, a name containing `=` or NUL, a value
+    /// containing NUL. Called early in spawn, before any side effect, and
+    /// again by [`ChildEnv::build`].
+    pub(crate) fn validate(sandbox: &Sandbox) -> Result<(), String> {
+        for name in &sandbox.inject_env_strip {
+            check_env_name(name)?;
+        }
+        for (key, value) in &sandbox.env {
+            check_env_name(key)?;
+            if value.contains('\0') {
+                return Err(format!("environment variable {key:?}: value contains a NUL byte"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply the sandbox's environment settings to a snapshot of this
+    /// process's environment, in the order the child used to apply them:
+    /// `clean_env` -> `inject_env_strip` -> `env` -> GPU visibility.
+    ///
+    /// Errors, before any fork, where [`ChildEnv::validate`] does.
+    pub(crate) fn build(sandbox: &Sandbox) -> Result<Self, String> {
+        let gpu = gpu_visible_devices(sandbox.gpu_devices.as_deref());
+        if !sandbox.clean_env
+            && sandbox.inject_env_strip.is_empty()
+            && sandbox.env.is_empty()
+            && gpu.is_none()
+        {
+            return Ok(Self::Inherit);
+        }
+        Self::validate(sandbox)?;
+        let base = if sandbox.clean_env { Vec::new() } else { std::env::vars_os().collect() };
+        let vars = compose_env(
+            base,
+            &sandbox.inject_env_strip,
+            sandbox.env.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+            gpu.as_deref(),
+        );
+        let entries = vars
+            .into_iter()
+            .map(|(key, value)| {
+                let mut entry = key.into_vec();
+                entry.push(b'=');
+                entry.extend(value.into_vec());
+                CString::new(entry)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| "environment entry contains a NUL byte".to_string())?;
+        let ptrs = entries
+            .iter()
+            .map(|e| e.as_ptr())
+            .chain(std::iter::once(std::ptr::null()))
+            .collect();
+        Ok(Self::Replace { _entries: entries, ptrs })
+    }
+
+    /// Point `environ` at the prepared array: one store, no lock.
+    ///
+    /// # Safety
+    ///
+    /// Only in the forked, single-threaded child, and `self` must stay alive
+    /// until the child execs or exits (`confine_child` never returns). In a
+    /// multi-threaded process the store would race every `getenv`, and once
+    /// `self` is dropped `environ` would dangle. After the store, the C
+    /// library (a later `setenv` in the in-process entry) and the chroot exec
+    /// rewrite may write through these pointers; that is the child's own copy.
+    unsafe fn install(&self) {
+        if let Self::Replace { ptrs, .. } = self {
+            environ = ptrs.as_ptr();
+        }
+    }
+}
+
+/// Reject a name `setenv`/`unsetenv` would reject (`EINVAL`) or that cannot be
+/// passed to C at all. The error shows the name only up to the first `=` or
+/// NUL, so a `KEY=secret` passed where a name belongs does not echo the value.
+fn check_env_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.contains('=') || name.contains('\0') {
+        let shown = name.split(['=', '\0']).next().unwrap_or_default();
+        return Err(format!("invalid environment variable name (starts {shown:?})"));
+    }
+    Ok(())
+}
+
+/// The `CUDA_VISIBLE_DEVICES`/`ROCR_VISIBLE_DEVICES` value for `gpu_devices`.
+/// `None` (leave both unset) when there is no list, or the list is empty
+/// (all GPUs visible).
+fn gpu_visible_devices(devices: Option<&[u32]>) -> Option<String> {
+    devices
+        .filter(|d| !d.is_empty())
+        .map(|d| d.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(","))
+}
+
+/// `vars` with every entry named in `strip` removed, then `set` and the GPU
+/// variables applied, with the semantics of the `remove_var`/`set_var` calls
+/// this replaces (glibc `unsetenv`/`setenv`): a removal drops every entry of
+/// that name; a set replaces the first entry of that name in place, or
+/// appends one.
+///
+/// The strip runs *before* `set`, so the inherited real secret behind an
+/// `env:` credential is dropped while a deliberate placeholder the user passes
+/// (e.g. `--env OPENAI_API_KEY=dummy`, which SDKs need set to start) survives.
+fn compose_env<'a>(
+    mut vars: Vec<(OsString, OsString)>,
+    strip: &[String],
+    set: impl IntoIterator<Item = (&'a str, &'a str)>,
+    gpu: Option<&str>,
+) -> Vec<(OsString, OsString)> {
+    fn put(vars: &mut Vec<(OsString, OsString)>, key: &str, value: &str) {
+        match vars.iter_mut().find(|(k, _)| k == key) {
+            Some(entry) => entry.1 = value.into(),
+            None => vars.push((key.into(), value.into())),
+        }
+    }
+    vars.retain(|(k, _)| !strip.iter().any(|name| k == name.as_str()));
+    for (key, value) in set {
+        put(&mut vars, key, value);
+    }
+    if let Some(visible) = gpu {
+        put(&mut vars, "CUDA_VISIBLE_DEVICES", visible);
+        put(&mut vars, "ROCR_VISIBLE_DEVICES", visible);
+    }
+    vars
+}
+
+// ============================================================
 // Child-side confinement (never returns)
 // ============================================================
 
@@ -221,6 +385,9 @@ pub(crate) enum ChildEntry<'a> {
 
 pub(crate) struct ChildSpawnArgs<'a> {
     pub sandbox: &'a Sandbox,
+    /// The child's environment, built in the parent before fork. See
+    /// [`ChildEnv`].
+    pub env: &'a ChildEnv,
     /// Terminal action after confinement: `execve` a command or run a fn
     /// in-process. See [`ChildEntry`].
     pub entry: ChildEntry<'a>,
@@ -285,6 +452,7 @@ fn effective_nofile(requested: u32, inherited: &libc::rlimit) -> libc::rlim_t {
 pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
     let ChildSpawnArgs {
         sandbox,
+        env,
         entry,
         pipes,
         no_supervisor,
@@ -540,35 +708,12 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
     }
     close_fds_above(2, &fds_to_keep);
 
-    // 13. Apply environment
-    if sandbox.clean_env {
-        // Clear all env vars first
-        for (key, _) in std::env::vars_os() {
-            std::env::remove_var(&key);
-        }
-    }
-    // Remove env vars whose value was loaded into the supervisor as a credential
-    // source, so the agent can't read the real secret straight from its own
-    // environment (this is the child; the mutation is process-local and post-fork).
-    // This runs *before* applying `sandbox.env`, so the inherited real secret is
-    // dropped but a deliberate placeholder the user passes (e.g.
-    // `--env OPENAI_API_KEY=dummy`, which SDKs need set to start) still survives.
-    for name in &sandbox.inject_env_strip {
-        std::env::remove_var(name);
-    }
-    for (key, value) in &sandbox.env {
-        std::env::set_var(key, value);
-    }
-
-    // 13b. GPU device visibility
-    if let Some(ref devices) = sandbox.gpu_devices {
-        if !devices.is_empty() {
-            let vis = devices.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(",");
-            std::env::set_var("CUDA_VISIBLE_DEVICES", &vis);
-            std::env::set_var("ROCR_VISIBLE_DEVICES", &vis);
-        }
-        // Empty list = all GPUs visible, don't set env vars
-    }
+    // 13. Apply the environment the parent built (`clean_env`,
+    // `inject_env_strip`, `env`, GPU visibility). Not through `std::env`: its
+    // lock may have been held by another parent thread at fork. See `ChildEnv`.
+    // SAFETY: this is the forked child, single-threaded, and `env` lives in
+    // the parent's frame, which this child never returns to.
+    unsafe { env.install() };
 
     // 13c. Optional: cap the file-descriptor table.
     //
@@ -629,9 +774,6 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         .collect();
 
     if let Some(fd) = exec_fd {
-        extern "C" {
-            static environ: *const *const libc::c_char;
-        }
         unsafe {
             libc::syscall(
                 libc::SYS_execveat,

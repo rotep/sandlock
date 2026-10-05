@@ -430,3 +430,116 @@ fn test_effective_nofile_clamps_to_both_inherited_bounds() {
     };
     assert_eq!(effective_nofile(4096, &unlimited), 4096);
 }
+
+fn os_pairs(pairs: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
+    pairs.iter().map(|(k, v)| ((*k).into(), (*v).into())).collect()
+}
+
+#[test]
+fn test_compose_env_keeps_order_replaces_in_place_and_appends() {
+    let got = compose_env(
+        os_pairs(&[("A", "1"), ("B", "2"), ("C", "3")]),
+        &[],
+        [("B", "two"), ("D", "4")],
+        None,
+    );
+    // `setenv` semantics: an existing name is replaced where it stands, a new
+    // one goes to the end.
+    assert_eq!(got, os_pairs(&[("A", "1"), ("B", "two"), ("C", "3"), ("D", "4")]));
+}
+
+#[test]
+fn test_compose_env_strip_removes_every_entry_then_set_survives() {
+    // A raw environment can hold a name twice; `unsetenv` drops both.
+    let got = compose_env(
+        os_pairs(&[("SECRET", "real"), ("KEEP", "x"), ("SECRET", "again")]),
+        &["SECRET".to_string()],
+        [],
+        None,
+    );
+    assert_eq!(got, os_pairs(&[("KEEP", "x")]));
+
+    // The strip runs before `env`, so a deliberate placeholder survives.
+    let got = compose_env(
+        os_pairs(&[("SECRET", "real")]),
+        &["SECRET".to_string()],
+        [("SECRET", "dummy")],
+        None,
+    );
+    assert_eq!(got, os_pairs(&[("SECRET", "dummy")]));
+}
+
+#[test]
+fn test_compose_env_set_replaces_only_the_first_duplicate() {
+    // `setenv` replaces the first match and leaves later duplicates alone.
+    let got = compose_env(os_pairs(&[("A", "1"), ("A", "2")]), &[], [("A", "x")], None);
+    assert_eq!(got, os_pairs(&[("A", "x"), ("A", "2")]));
+}
+
+#[test]
+fn test_compose_env_gpu_applies_last() {
+    let got = compose_env(
+        os_pairs(&[("CUDA_VISIBLE_DEVICES", "inherited")]),
+        &[],
+        [("CUDA_VISIBLE_DEVICES", "from-env")],
+        Some("0,2"),
+    );
+    assert_eq!(
+        got,
+        os_pairs(&[("CUDA_VISIBLE_DEVICES", "0,2"), ("ROCR_VISIBLE_DEVICES", "0,2")])
+    );
+}
+
+#[test]
+fn test_compose_env_keeps_non_utf8_bytes() {
+    use std::os::unix::ffi::OsStrExt;
+    let raw = std::ffi::OsStr::from_bytes(b"\xff\xfe").to_os_string();
+    let got = compose_env(vec![("RAW".into(), raw.clone())], &[], [("X", "1")], None);
+    assert_eq!(got, vec![("RAW".into(), raw), ("X".into(), "1".into())]);
+}
+
+#[test]
+fn test_gpu_visible_devices() {
+    assert_eq!(gpu_visible_devices(None), None);
+    // An empty list means "all GPUs": leave the variables unset.
+    assert_eq!(gpu_visible_devices(Some(&[])), None);
+    assert_eq!(gpu_visible_devices(Some(&[1, 3])), Some("1,3".to_string()));
+}
+
+#[test]
+fn test_child_env_inherits_when_nothing_changes() {
+    let sandbox = Sandbox::builder().build().unwrap();
+    assert!(matches!(ChildEnv::build(&sandbox), Ok(ChildEnv::Inherit)));
+    // An empty GPU list sets nothing either.
+    let sandbox = Sandbox::builder().gpu_devices(vec![]).build().unwrap();
+    assert!(matches!(ChildEnv::build(&sandbox), Ok(ChildEnv::Inherit)));
+}
+
+#[test]
+fn test_child_env_clean_env_holds_only_declared_vars() {
+    let sandbox = Sandbox::builder()
+        .clean_env(true)
+        .env_var("ONLY", "1")
+        .build()
+        .unwrap();
+    let Ok(ChildEnv::Replace { _entries, ptrs }) = ChildEnv::build(&sandbox) else {
+        panic!("expected a replaced environment");
+    };
+    assert_eq!(_entries, vec![CString::new("ONLY=1").unwrap()]);
+    assert_eq!(ptrs.len(), 2);
+    assert_eq!(ptrs[0], _entries[0].as_ptr());
+    assert!(ptrs[1].is_null(), "environ must be NULL-terminated");
+}
+
+#[test]
+fn test_child_env_rejects_what_setenv_would_reject() {
+    // These used to panic in `set_var` inside the forked child; now they fail
+    // before the fork.
+    for key in ["", "A=B", "A\0B"] {
+        let sandbox = Sandbox::builder().env_var(key, "v").build().unwrap();
+        assert!(ChildEnv::build(&sandbox).is_err(), "name {key:?} must be rejected");
+    }
+    let sandbox = Sandbox::builder().env_var("A", "v\0w").build().unwrap();
+    let err = ChildEnv::build(&sandbox).err().expect("a NUL in a value must be rejected");
+    assert!(!err.contains("v\0w"), "the error must not echo the value");
+}

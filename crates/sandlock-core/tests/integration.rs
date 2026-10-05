@@ -87,3 +87,6 @@ mod test_tty;
 
 #[path = "integration/test_process_groups.rs"]
 mod test_process_groups;
+
+#[path = "integration/test_child_env.rs"]
+mod test_child_env;

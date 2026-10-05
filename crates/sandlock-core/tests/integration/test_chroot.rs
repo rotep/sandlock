@@ -130,6 +130,39 @@ async fn test_chroot_ls_root() {
     cleanup_rootfs(&rootfs);
 }
 
+/// Under chroot, a bare command name resolves against the `PATH` the sandbox
+/// sets: the child's environment is built in the parent and installed before
+/// `execvp` (see `context::ChildEnv`), and the lookup happens inside the root.
+/// `helper` exists only in `/opt/sl/bin` of the root, which is neither on the
+/// default search path nor on the host's `PATH`.
+#[tokio::test]
+async fn test_chroot_path_lookup_with_sandbox_env() {
+    let rootfs = build_test_rootfs("path-env");
+    fs::create_dir_all(rootfs.join("opt/sl/bin")).unwrap();
+    std::os::unix::fs::symlink("../../../usr/bin/rootfs-helper", rootfs.join("opt/sl/bin/helper"))
+        .expect("failed to create the helper symlink");
+
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_read("/tmp")
+        .fs_read("/opt")
+        .clean_env(true)
+        .env_var("PATH", "/opt/sl/bin")
+        .build()
+        .unwrap();
+
+    let result = policy.clone().run(&["helper", "echo", "found-in-chroot"]).await;
+    cleanup_rootfs(&rootfs);
+    let r = result.expect("run under chroot");
+    assert!(r.success(), "stderr: {}", r.stderr_str().unwrap_or(""));
+    assert_eq!(r.stdout_str().unwrap_or("").trim(), "found-in-chroot");
+}
+
 /// Path traversal via /../../ stays confined — reads a file unique to the chroot.
 #[tokio::test]
 async fn test_chroot_no_escape() {
