@@ -14,8 +14,8 @@ use crate::seccomp::notif::{read_child_mem, NotifAction};
 use crate::sys::structs::{SeccompNotif, ECONNREFUSED};
 
 use super::materialize::{
-    materialize_msg, mmsg_entry_ptr, mmsg_msglen_addr, named_unix_socket_path, ChildMsghdr,
-    MaterializedMsg,
+    is_named_unix_pathname, materialize_msg, mmsg_entry_ptr, mmsg_msglen_addr,
+    named_unix_socket_path, ChildMsghdr, MaterializedMsg,
 };
 use super::send_engine::{batch_send_step, resolve_send, wants_blocking, BatchStep};
 use super::verdict::{path_under_any, real_path_under_any};
@@ -277,7 +277,19 @@ pub(super) fn unix_sendmsg_gate(
     let addr_bytes =
         super::read_sockaddr(notif_fd, notif.id, notif.pid, hdr.name_ptr, hdr.namelen as usize).ok()?;
     // None unless this is a NAMED AF_UNIX target; IP/abstract fall through.
-    let path = named_unix_socket_path(&addr_bytes)?;
+    let path = match named_unix_socket_path(&addr_bytes) {
+        Some(p) => p,
+        None => {
+            // Issue #143: a named AF_UNIX target we cannot decode (non-UTF-8
+            // `sun_path`) must not fall through to the ungated IP/Continue path.
+            // This gate is only entered with the fs gate on (see caller), so
+            // fail closed rather than returning `None` and letting it through.
+            if is_named_unix_pathname(&addr_bytes) {
+                return Some(NotifAction::Errno(libc::EACCES));
+            }
+            return None;
+        }
+    };
 
     if ctx.policy.chroot_root.is_some() {
         return Some(if path_under_any(&path, &ctx.policy.chroot_writable) {
@@ -370,6 +382,31 @@ pub(super) fn mmsg_entry_named_unix_path(
     let addr_bytes =
         super::read_sockaddr(notif_fd, notif.id, notif.pid, hdr.name_ptr, hdr.namelen as usize).ok()?;
     named_unix_socket_path(&addr_bytes)
+}
+
+/// Like [`mmsg_entry_named_unix_path`], but reports only *whether* a `sendmmsg`
+/// entry targets a named `AF_UNIX` socket — true even when its `sun_path` is not
+/// valid UTF-8 (which [`mmsg_entry_named_unix_path`] cannot return, since it
+/// requires the path to decode). Lets the sendmmsg gate fail closed on an
+/// undecodable named entry instead of letting the whole batch `Continue` past
+/// the fs gate (upstream issue #143).
+pub(super) fn mmsg_entry_is_named_unix_pathname(
+    notif: &SeccompNotif,
+    notif_fd: RawFd,
+    entry_ptr: u64,
+) -> bool {
+    let Ok(hdr) = ChildMsghdr::read(notif, notif_fd, entry_ptr) else {
+        return false;
+    };
+    if hdr.connected() {
+        return false;
+    }
+    let Ok(addr_bytes) =
+        super::read_sockaddr(notif_fd, notif.id, notif.pid, hdr.name_ptr, hdr.namelen as usize)
+    else {
+        return false;
+    };
+    is_named_unix_pathname(&addr_bytes)
 }
 
 /// On-behalf `sendmmsg` for a batch containing NAMED `AF_UNIX` entries

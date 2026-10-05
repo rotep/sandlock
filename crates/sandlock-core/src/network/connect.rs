@@ -12,8 +12,8 @@ use crate::seccomp::notif::NotifAction;
 use crate::sys::structs::{SeccompNotif, ECONNREFUSED};
 
 use super::materialize::{
-    named_unix_socket_path, parse_ip_from_sockaddr, parse_port_from_sockaddr,
-    set_port_in_sockaddr, sockaddr_is_ipv6,
+    is_named_unix_pathname, named_unix_socket_path, parse_ip_from_sockaddr,
+    parse_port_from_sockaddr, set_port_in_sockaddr, sockaddr_is_ipv6,
 };
 use super::unix::connect_named_unix_on_behalf;
 use super::verdict::{layered_destination_verdict, path_under_any};
@@ -151,6 +151,17 @@ pub(super) async fn connect_on_behalf(
                         &ctx.policy.chroot_writable,
                     )
                 }
+            }
+            // A NAMED AF_UNIX socket whose `sun_path` is not valid UTF-8:
+            // `named_unix_socket_path` returned `None` above, which without this
+            // arm would fall through to `Continue` and reach the socket ungated
+            // (upstream issue #143). The fs gate is on and we cannot render the
+            // path to check it against the write grants, so fail closed — an
+            // ungated connect is exactly the escape the gate exists to stop. The
+            // decision is made on `addr_bytes` (our immune copy) and never
+            // returns `Continue`, so it is TOCTOU-safe like the arm above.
+            None if ctx.policy.has_unix_fs_gate && is_named_unix_pathname(&addr_bytes) => {
+                NotifAction::Errno(libc::EACCES)
             }
             // Abstract/unnamed socket, non-AF_UNIX family, or gate disabled.
             _ => NotifAction::Continue,
