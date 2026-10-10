@@ -148,7 +148,7 @@ pub(super) async fn connect_on_behalf(
                         notif.pid,
                         sockfd,
                         &path,
-                        &ctx.policy.chroot_writable,
+                        &ctx.policy.unix_gate_writable,
                     )
                 }
             }

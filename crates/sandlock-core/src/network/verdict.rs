@@ -80,14 +80,25 @@ pub(crate) async fn check_ip_destination(
     layered_destination_verdict(&effective, ip, port)
 }
 
-/// True if `real` (an already-canonical path) is at or under any of `prefixes`,
-/// canonicalizing each prefix so a symlinked grant path still matches. Touches
-/// only the supervisor's own view of the grant paths, never child state.
+/// `prefixes`, each canonicalized now so a grant spelled through a symlink
+/// still matches the real path of what it names; a prefix that does not
+/// resolve is kept as given. Call it once, when the policy is built: the
+/// Landlock rules are bound to the inodes the grants named at start, so a
+/// grant path replaced by a symlink later must not move a check made against
+/// the result.
+pub(crate) fn canonical_prefixes(prefixes: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
+    prefixes
+        .iter()
+        .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
+        .collect()
+}
+
+/// True if `real` (an already-canonical path) is at or under any of
+/// `prefixes`, which must already be canonical ([`canonical_prefixes`]).
+/// Nothing is resolved here, so the answer cannot follow a grant path that
+/// was replaced after start.
 pub(crate) fn real_path_under_any(real: &std::path::Path, prefixes: &[std::path::PathBuf]) -> bool {
-    prefixes.iter().any(|p| {
-        let canon = std::fs::canonicalize(p);
-        real.starts_with(canon.as_deref().unwrap_or(p))
-    })
+    prefixes.iter().any(|p| real.starts_with(p))
 }
 
 /// True if `path`, lexically normalized (`.`/`..` resolved without touching the

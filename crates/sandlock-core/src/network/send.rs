@@ -125,7 +125,7 @@ pub(super) async fn sendto_on_behalf(
                         buf_len,
                         flags,
                         &path,
-                        &ctx.policy.chroot_writable,
+                        &ctx.policy.unix_gate_writable,
                     )
                 }
             }
@@ -499,7 +499,7 @@ pub(super) async fn sendmmsg_on_behalf(
                     msgvec_ptr,
                     vlen,
                     flags,
-                    &ctx.policy.chroot_writable,
+                    &ctx.policy.unix_gate_writable,
                 );
             }
         }

@@ -46,6 +46,7 @@ pub use rules::{
 };
 
 use connect::connect_on_behalf;
+pub(crate) use verdict::canonical_prefixes;
 use send::{sendmmsg_on_behalf, sendmsg_on_behalf, sendto_on_behalf};
 
 /// Largest sockaddr length we copy from the child when gating a `connect`/

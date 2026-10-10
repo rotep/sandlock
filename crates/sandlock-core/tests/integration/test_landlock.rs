@@ -850,6 +850,104 @@ async fn test_named_unix_socket_symlink_escape_denied() {
     let _ = std::fs::remove_dir_all(&dirs.base);
 }
 
+// The gate compares the pinned socket's real path against the write grants as
+// they resolved when the sandbox started, like the Landlock rules, which hold
+// the inodes the grants named then. A grant directory replaced by a symlink
+// after start (by anyone who can write its parent) must not carry the grant to
+// the symlink's target: before the fix the gate re-canonicalized the grants on
+// every connect, so the second connect below reached the ungranted socket.
+#[tokio::test]
+async fn test_named_unix_gate_ignores_a_grant_replaced_after_start() {
+    if sandlock_core::landlock_abi_version().unwrap_or(0) < 6 {
+        eprintln!("Skipping: Landlock ABI v6 required");
+        return;
+    }
+
+    let dirs = socket_dirs("unix-grant-swap");
+    let granted = dirs.base.join("a"); // the only fs_write grant besides `out`
+    let outside = &dirs.sock; // NOT granted: where the listener lives
+    std::fs::create_dir_all(&granted).unwrap();
+    let real_sock = outside.join("s.sock");
+    let _ = std::fs::remove_file(&real_sock);
+    let listener = std::os::unix::net::UnixListener::bind(&real_sock).unwrap();
+
+    let first = dirs.out.join("first");
+    let out = dirs.out.join("result");
+    let child_script = format!(
+        concat!(
+            "import os, socket, time\n",
+            "def attempt():\n",
+            "    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n",
+            "    try:\n",
+            "        s.connect('{sock}')\n",
+            "        return 'CONNECTED'\n",
+            "    except OSError as e:\n",
+            "        return 'ERRNO:%d' % e.errno\n",
+            "    finally:\n",
+            "        s.close()\n",
+            "before = attempt()\n",
+            "open('{first}', 'w').write(before)\n",
+            "swapped = 'TIMEOUT'\n",
+            "for _ in range(200):\n",
+            "    if os.path.islink('{granted}'):\n",
+            "        swapped = 'SWAPPED'\n",
+            "        break\n",
+            "    time.sleep(0.05)\n",
+            "open('{out}', 'w').write(' '.join([before, swapped, attempt()]))\n",
+        ),
+        sock = real_sock.display(),
+        first = first.display(),
+        granted = granted.display(),
+        out = out.display(),
+    );
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write(dirs.out.to_str().unwrap())
+        .fs_write(granted.to_str().unwrap())
+        .build()
+        .unwrap();
+
+    // Once the child has made its first attempt, replace the granted directory
+    // with a symlink to the listener's directory, from outside the sandbox.
+    let swap = async {
+        for _ in 0..200 {
+            if first.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(first.exists(), "the child never made its first attempt");
+        std::fs::remove_dir(&granted).unwrap();
+        std::os::unix::fs::symlink(outside, &granted).unwrap();
+    };
+    let argv = ["python3", "-c", child_script.as_str()];
+    let mut sandbox = policy.clone();
+    let (result, ()) = tokio::join!(sandbox.run(&argv), swap);
+    let result = result.unwrap();
+    assert!(result.success(), "stderr: {}", result.stderr_str().unwrap_or(""));
+
+    // Positive control: through the swapped grant path the socket is live.
+    assert!(std::os::unix::net::UnixStream::connect(granted.join("s.sock")).is_ok());
+    let contents = std::fs::read_to_string(&out).unwrap_or_default();
+    // The child saw the swap before its second attempt, so that attempt ran
+    // against the replaced grant path.
+    assert_eq!(
+        contents, "ERRNO:13 SWAPPED ERRNO:13",
+        "a grant path replaced after start must not move the gate (got {contents:?})"
+    );
+
+    drop(listener);
+    let _ = std::fs::remove_file(&granted);
+    let _ = std::fs::remove_dir_all(&dirs.base);
+}
+
 // Datagram vector: a unix SOCK_DGRAM `sendto()` to a named socket reaches it
 // without a prior connect(), and is a WRITE on the target inode just like
 // connect. The gate must cover it too: a sendto to a socket whose path is not

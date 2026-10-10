@@ -1150,6 +1150,7 @@ mod handler_tests {
                 chroot_root: None,
                 chroot_readable: Vec::new(),
                 chroot_writable: Vec::new(),
+                unix_gate_writable: Vec::new(),
                 chroot_denied: Vec::new(),
                 chroot_mounts: Vec::new(),
                 chroot_mount_ro: Vec::new(),

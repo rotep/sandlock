@@ -305,7 +305,7 @@ pub(super) fn unix_sendmsg_gate(
         msghdr_ptr,
         flags,
         &path,
-        &ctx.policy.chroot_writable,
+        &ctx.policy.unix_gate_writable,
     ))
 }
 

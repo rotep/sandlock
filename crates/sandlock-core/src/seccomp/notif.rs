@@ -1085,6 +1085,12 @@ pub struct NotifPolicy {
     pub chroot_readable: Vec<std::path::PathBuf>,
     /// Virtual paths allowed for writing under chroot (original user-specified paths).
     pub chroot_writable: Vec<std::path::PathBuf>,
+    /// The write grants the named `AF_UNIX` gate compares a pinned socket's
+    /// real path against (non-chroot mode): `chroot_writable`, each
+    /// canonicalized once before the child is forked, ahead of its Landlock
+    /// rules. Resolving them once keeps the gate on what the grants named at
+    /// start; a grant path replaced by a symlink later does not move it.
+    pub unix_gate_writable: Vec<std::path::PathBuf>,
     /// Virtual paths explicitly denied under chroot.
     pub chroot_denied: Vec<std::path::PathBuf>,
     /// Mount mappings: (virtual_path, host_path) pairs.

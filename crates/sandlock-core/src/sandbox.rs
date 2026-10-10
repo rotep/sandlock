@@ -2018,6 +2018,15 @@ impl Sandbox {
         // not touch `std::env` between fork and exec (see `context::ChildEnv`).
         let child_env = context::ChildEnv::build(self).map_err(SandboxRuntimeError::Child)?;
 
+        // The named AF_UNIX gate's write grants, resolved now, before the
+        // child exists to open its Landlock rules: a grant path replaced by a
+        // symlink after this point moves neither (see `NotifPolicy`).
+        let unix_gate_writable = if chroot_root.is_none() {
+            crate::network::canonical_prefixes(&self.fs_writable)
+        } else {
+            Vec::new()
+        };
+
         // Claim before fork so a name collision leaves no child to reap.
         let sandbox_name = self.rt().name.clone();
         let mut control_socket = match crate::control::bind_control_socket(&sandbox_name) {
@@ -2211,6 +2220,7 @@ impl Sandbox {
                 chroot_root: chroot_root.clone(),
                 chroot_readable: self.fs_readable.clone(),
                 chroot_writable: self.fs_writable.clone(),
+                unix_gate_writable,
                 chroot_denied: self.fs_denied.clone(),
                 chroot_mounts: crate::chroot::resolve::resolve_chroot_mounts(&self.fs_mount),
                 chroot_mount_ro: self.fs_mount_ro.clone(),
