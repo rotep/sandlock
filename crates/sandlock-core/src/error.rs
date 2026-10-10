@@ -136,6 +136,14 @@ pub enum BranchError {
     /// directories, and symlinks; everything else stays with the kernel.
     #[error("entry is not owned by this branch")]
     NotOwned,
+
+    /// Copying or listing the lower entry would show the child something its
+    /// read grants do not cover (`SandboxBuilder::cow_honor_read_grants`). The
+    /// call site answers `EACCES`, as Landlock would, and must never fall
+    /// back to `Continue`: chmod/chown/utimensat would then reach the real
+    /// lower file, which Landlock does not restrict.
+    #[error("lower entry is outside the sandbox's read grants")]
+    NotGranted,
 }
 
 /// Convenience type alias.

@@ -520,8 +520,19 @@ async fn run_txn(
     let storage = base.fs_storage.clone();
     let max_disk = base.max_disk.map(|b| b.0).unwrap_or(0);
 
-    let branch = crate::cow::seccomp::SeccompCowBranch::create(&workdir, storage.as_deref(), max_disk)
+    let mut branch = crate::cow::seccomp::SeccompCowBranch::create(&workdir, storage.as_deref(), max_disk)
         .map_err(|source| TxnError::Branch { workdir: workdir.clone(), source })?;
+    // One branch serves every stage, so it honours the read grants of every
+    // stage that asked for it: never looser than any of them.
+    let gate = stages
+        .iter()
+        .filter(|stage| stage.sandbox.cow_honor_read_grants)
+        .fold(crate::cow::read_gate::CowReadGate::disabled(), |gate, stage| {
+            gate.and(crate::cow::read_gate::CowReadGate::from_grants(
+                stage.sandbox.fs_readable.iter().chain(stage.sandbox.fs_writable.iter()),
+            ))
+        });
+    branch.set_read_gate(gate);
     let upper_dir = branch.upper_dir().to_path_buf();
 
     let mut cow_state = crate::seccomp::state::CowState::new();

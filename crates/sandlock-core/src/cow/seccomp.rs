@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
-use std::os::unix::io::FromRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use crate::result::{Entry, EntryKind};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -41,6 +41,7 @@ fn branch_errno(e: BranchError) -> i32 {
         // A kernel object cannot be staged in the upper; EXDEV makes mv and
         // ln fall back to mknod plus unlink, which the branch virtualizes.
         BranchError::NotOwned => libc::EXDEV,
+        BranchError::NotGranted => libc::EACCES,
         BranchError::Operation(_) | BranchError::Conflict(_) => libc::EIO,
     }
 }
@@ -721,6 +722,9 @@ pub struct SeccompCowBranch {
     keep_if_abandoned: bool,
     max_disk_bytes: u64,
     disk_used: u64,
+    /// The read grants a copy-up or a merged listing must honour
+    /// (`SandboxBuilder::cow_honor_read_grants`). Disabled unless set.
+    read_gate: crate::cow::read_gate::CowReadGate,
 }
 
 /// The entry at `rel` under `root`, confined and without following
@@ -943,7 +947,18 @@ impl SeccompCowBranch {
             keep_if_abandoned: false,
             max_disk_bytes,
             disk_used: 0,
+            read_gate: crate::cow::read_gate::CowReadGate::disabled(),
         })
+    }
+
+    /// Make every copy-up and merged listing honour `gate` from now on.
+    pub fn set_read_gate(&mut self, gate: crate::cow::read_gate::CowReadGate) {
+        self.read_gate = gate;
+    }
+
+    /// The read grants this branch honours (disabled by default).
+    pub fn read_gate(&self) -> &crate::cow::read_gate::CowReadGate {
+        &self.read_gate
     }
 
     /// The upper directory where writes are stored.
@@ -1187,10 +1202,16 @@ impl SeccompCowBranch {
 
     /// Execute a file copy synchronously. Used by `ensure_cow_copy` and the
     /// async dispatch (via `spawn_blocking`).
+    ///
+    /// `gate` is the branch's [`read_gate`](Self::read_gate), taken by the
+    /// caller under the branch lock. A source it refuses is not copied: the
+    /// error is recognisable with `cow::read_gate::is_not_granted`, and
+    /// nothing is created in the upper.
     pub fn execute_copy(
         workdir_root: &Path,
         upper_root: &Path,
         rel: &str,
+        gate: &crate::cow::read_gate::CowReadGate,
     ) -> Result<Option<[u8; 32]>, std::io::Error> {
         let create_dest = || -> Result<fs::File, std::io::Error> {
             let fd = crate::sys::fs::openat2_in_root(
@@ -1226,6 +1247,12 @@ impl SeccompCowBranch {
         };
 
         let mut src = unsafe { fs::File::from_raw_fd(src_fd) };
+        // The bytes are about to reach the child through the upper. Judge the
+        // descriptor they will be read from, not the path, so the entry cannot
+        // be swapped between the check and the copy.
+        if !gate.allows_fd(src_fd) {
+            return Err(crate::cow::read_gate::not_granted_error());
+        }
         // prepare_copy classified this entry as a regular file, but it can
         // change type between that lstat and this open. Never stream a
         // non-regular source: a FIFO read blocks or steals pipe data (issue
@@ -1249,12 +1276,16 @@ impl SeccompCowBranch {
         match self.prepare_copy(rel_path)? {
             CowCopyPlan::Ready(upper) => Ok(upper),
             CowCopyPlan::NeedsCopy { upper, lower: _lower, file_size } => {
-                match Self::execute_copy(&self.workdir, &self.upper, rel_path) {
+                match Self::execute_copy(&self.workdir, &self.upper, rel_path, &self.read_gate) {
                     Ok(digest) => {
                         if let Some(d) = digest {
                             self.record_digest(rel_path, d);
                         }
                         Ok(upper)
+                    }
+                    Err(e) if crate::cow::read_gate::is_not_granted(&e) => {
+                        self.rollback_copy(file_size);
+                        Err(BranchError::NotGranted)
                     }
                     Err(e) => {
                         self.rollback_copy(file_size);
@@ -1316,8 +1347,21 @@ impl SeccompCowBranch {
             if st.st_mode & libc::S_IFMT != libc::S_IFDIR {
                 continue;
             }
-            let rd = fs::read_dir(self.workdir.join(&rel))
-                .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+            let rd = if self.read_gate.is_enabled() {
+                // The names are about to reach the child through the upper.
+                // List the lower directory from the descriptor the gate judged
+                // (confined, so a symlink cannot lead elsewhere, and immune to
+                // a swap between the check and the read). A whiteout hides
+                // every lower name below it, so there is nothing to judge.
+                match self.open_gated_lower_dir(&rel)? {
+                    Some(dir) => fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))
+                        .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?,
+                    None => continue,
+                }
+            } else {
+                fs::read_dir(self.workdir.join(&rel))
+                    .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?
+            };
             for entry in rd {
                 let entry = entry.map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
                 let name = entry.file_name().to_string_lossy().into_owned();
@@ -1899,7 +1943,47 @@ impl SeccompCowBranch {
 
     /// List merged directory entries (upper + lower - deleted).
     pub fn list_merged_dir(&self, rel_path: &str) -> Vec<String> {
-        let lower_dir = self.workdir.join(rel_path);
+        self.merge_listing(rel_path, fs::read_dir(self.workdir.join(rel_path)).ok())
+    }
+
+    /// The lower directory a merged listing of `rel_path` may take its names
+    /// from while the read gate is enabled: opened confined to the workdir, so
+    /// no symlink can lead the listing to another directory, and judged by
+    /// that descriptor, so the names listed are the names judged. `Ok(None)`
+    /// when there are no lower names to show (nothing there, or a whiteout
+    /// hides them); `Err(EACCES)` when the gate refuses the directory.
+    pub fn open_gated_lower_dir(&self, rel_path: &str) -> Result<Option<fs::File>, i32> {
+        if self.deleted.covers(rel_path) {
+            return Ok(None);
+        }
+        match crate::sys::fs::openat2_in_root(
+            &self.workdir,
+            rel_path,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            0,
+        ) {
+            Ok(fd) => {
+                let dir = unsafe { fs::File::from_raw_fd(fd) };
+                if self.read_gate.allows_fd(dir.as_raw_fd()) {
+                    Ok(Some(dir))
+                } else {
+                    Err(libc::EACCES)
+                }
+            }
+            Err(libc::ENOENT) | Err(libc::ENOTDIR) => Ok(None),
+            Err(_) => Err(libc::EACCES),
+        }
+    }
+
+    /// Like [`list_merged_dir`](Self::list_merged_dir), with the lower names
+    /// read from `lower` (see [`open_gated_lower_dir`](Self::open_gated_lower_dir))
+    /// or, with `None`, no lower names at all.
+    pub fn list_merged_dir_from(&self, rel_path: &str, lower: Option<&fs::File>) -> Vec<String> {
+        let rd = lower.and_then(|dir| fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd())).ok());
+        self.merge_listing(rel_path, rd)
+    }
+
+    fn merge_listing(&self, rel_path: &str, lower: Option<fs::ReadDir>) -> Vec<String> {
         let upper_dir = self.upper.join(rel_path);
         let mut entries = std::collections::BTreeSet::new();
 
@@ -1908,7 +1992,7 @@ impl SeccompCowBranch {
                 entries.insert(e.file_name().to_string_lossy().into_owned());
             }
         }
-        if let Ok(rd) = fs::read_dir(&lower_dir) {
+        if let Some(rd) = lower {
             for e in rd.flatten() {
                 let name = e.file_name().to_string_lossy().into_owned();
                 let child_rel = if rel_path == "." || rel_path.is_empty() {
@@ -4911,6 +4995,98 @@ mod tests {
         assert!(!wd.join("d2/gone.txt").exists());
     }
 
+    /// A workdir with one granted subtree (`pub`) and one the child cannot
+    /// read (`private`), and a branch whose read gate grants only `pub`.
+    fn gated_branch() -> (tempfile::TempDir, tempfile::TempDir, PathBuf, SeccompCowBranch) {
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let wd = workdir.path().canonicalize().unwrap();
+        fs::create_dir(wd.join("pub")).unwrap();
+        fs::write(wd.join("pub/readme.txt"), "public").unwrap();
+        fs::create_dir(wd.join("private")).unwrap();
+        fs::write(wd.join("private/secret.txt"), "SECRET").unwrap();
+        let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
+        branch.set_read_gate(crate::cow::read_gate::CowReadGate::from_grants([&wd.join("pub")]));
+        (workdir, storage, wd, branch)
+    }
+
+    #[test]
+    fn read_gate_refuses_copying_up_an_ungranted_file() {
+        let (_w, _s, _wd, mut branch) = gated_branch();
+        assert!(matches!(
+            branch.ensure_cow_copy("private/secret.txt"),
+            Err(BranchError::NotGranted)
+        ));
+        let upper = branch.upper_dir().to_path_buf();
+        assert!(!upper.join("private/secret.txt").exists(), "nothing reaches the upper");
+        assert_eq!(branch.disk_used, 0, "the quota reservation is rolled back");
+        assert_eq!(branch_errno(BranchError::NotGranted), libc::EACCES);
+    }
+
+    #[test]
+    fn read_gate_refuses_a_write_open_of_an_ungranted_file() {
+        let (_w, _s, wd, mut branch) = gated_branch();
+        let secret = format!("{}/private/secret.txt", wd.display());
+        assert!(matches!(branch.handle_open(&secret, O_RDWR), Err(BranchError::NotGranted)));
+        assert!(!branch.upper_dir().join("private/secret.txt").exists());
+    }
+
+    #[test]
+    fn read_gate_still_copies_granted_files_and_creates_new_ones() {
+        let (_w, _s, _wd, mut branch) = gated_branch();
+        let upper = branch.ensure_cow_copy("pub/readme.txt").unwrap();
+        assert_eq!(fs::read_to_string(&upper).unwrap(), "public");
+        // A new file has no lower bytes to disclose, wherever it is created.
+        let fresh = branch.ensure_cow_copy("private/new.txt").unwrap();
+        assert!(!fresh.exists() || fs::read(&fresh).unwrap().is_empty());
+    }
+
+    #[test]
+    fn read_gate_refuses_renaming_an_ungranted_directory_and_rolls_back() {
+        let (_w, _s, wd, mut branch) = gated_branch();
+        assert_eq!(
+            branch.handle_rename(
+                &format!("{}/private", wd.display()),
+                &format!("{}/moved", wd.display()),
+            ),
+            Err(libc::EACCES)
+        );
+        let upper = branch.upper_dir().to_path_buf();
+        assert!(!upper.join("private").exists(), "the staged directory is removed again");
+        assert!(!upper.join("moved").exists());
+        assert!(!branch.is_deleted("private"), "the source is not whiteouted");
+        assert_eq!(fs::read_to_string(wd.join("private/secret.txt")).unwrap(), "SECRET");
+    }
+
+    #[test]
+    fn read_gate_lists_lower_names_only_from_the_judged_directory() {
+        let (_w, _s, wd, mut branch) = gated_branch();
+        std::os::unix::fs::symlink(wd.join("private"), wd.join("pub/lnk")).unwrap();
+        assert_eq!(branch.open_gated_lower_dir("private").unwrap_err(), libc::EACCES);
+        // Resolved inside the workdir, the absolute symlink leads nowhere, so
+        // the listing shows no lower names instead of `private`'s.
+        let lower = branch.open_gated_lower_dir("pub/lnk").unwrap();
+        assert!(lower.is_none());
+        assert!(branch.list_merged_dir_from("pub/lnk", lower.as_ref()).is_empty());
+        let lower = branch.open_gated_lower_dir("pub").unwrap();
+        assert_eq!(
+            branch.list_merged_dir_from("pub", lower.as_ref()),
+            vec!["lnk".to_string(), "readme.txt".to_string()]
+        );
+        // A whiteout hides every lower name below it: nothing to judge.
+        branch.mark_deleted("private");
+        assert!(branch.open_gated_lower_dir("private").unwrap().is_none());
+    }
+
+    #[test]
+    fn read_gate_still_renames_a_granted_directory() {
+        let (_w, _s, wd, mut branch) = gated_branch();
+        assert!(branch
+            .handle_rename(&format!("{}/pub", wd.display()), &format!("{}/pub2", wd.display()))
+            .unwrap());
+        assert_eq!(branch.list_merged_dir("pub2"), vec!["readme.txt".to_string()]);
+    }
+
     #[test]
     fn rename_hidden_source_gives_deleted() {
         let (workdir, storage) = setup_workdir();
@@ -5372,7 +5548,7 @@ mod tests {
         let branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         let workdir_root = branch.workdir().to_path_buf();
         let upper_root = branch.upper_dir().to_path_buf();
-        SeccompCowBranch::execute_copy(&workdir_root, &upper_root, "race").unwrap();
+        SeccompCowBranch::execute_copy(&workdir_root, &upper_root, "race", &crate::cow::read_gate::CowReadGate::disabled()).unwrap();
         assert_eq!(fs::read(upper_root.join("race")).unwrap(), b"");
     }
 
@@ -6317,7 +6493,7 @@ mod tests {
         let workdir = tempfile::tempdir().unwrap();
         let upper = tempfile::tempdir().unwrap();
         fs::write(workdir.path().join("f"), "abc").unwrap();
-        let digest = SeccompCowBranch::execute_copy(workdir.path(), upper.path(), "f").unwrap().unwrap();
+        let digest = SeccompCowBranch::execute_copy(workdir.path(), upper.path(), "f", &crate::cow::read_gate::CowReadGate::disabled()).unwrap().unwrap();
         assert_eq!(hex(&digest), SHA256_ABC);
     }
 

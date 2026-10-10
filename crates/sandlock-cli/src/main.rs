@@ -550,6 +550,7 @@ async fn run_command(args: RunArgs) -> Result<i32> {
         b = b.on_exit(base.on_exit.clone());
         b = b.on_error(base.on_error.clone());
         b = b.deterministic_dirs(base.deterministic_dirs);
+        b = b.cow_honor_read_grants(base.cow_honor_read_grants);
         // Determinism / process knobs
         b = b.no_randomize_memory(base.no_randomize_memory);
         b = b.no_huge_pages(base.no_huge_pages);
@@ -601,6 +602,7 @@ async fn run_command(args: RunArgs) -> Result<i32> {
     if pb.no_randomize_memory { builder = builder.no_randomize_memory(true); }
     if pb.no_huge_pages { builder = builder.no_huge_pages(true); }
     if pb.deterministic_dirs { builder = builder.deterministic_dirs(true); }
+    if pb.cow_honor_read_grants { builder = builder.cow_honor_read_grants(true); }
     if pb.no_coredump { builder = builder.no_coredump(true); }
 
     // CLI overrides — non-clap-friendly fields (still parsed here)

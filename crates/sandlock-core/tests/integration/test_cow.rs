@@ -1538,3 +1538,223 @@ async fn test_seccomp_cow_fchmodat2_is_virtualized() {
     assert!(!workdir.join("made").exists());
     let _ = fs::remove_dir_all(&workdir);
 }
+
+// ============================================================
+// cow_honor_read_grants: a COW copy-up or merged listing never shows the
+// child a workdir entry its read grants do not cover.
+// ============================================================
+
+/// One file under `private/` per probe, so no probe sees another's effect.
+const READ_GATE_FILES: [&str; 6] = ["secret", "trunc", "chmod", "chown", "utime", "link"];
+
+/// A workdir with a granted `pub/` and a `private/` no grant covers, plus
+/// lower symlinks under `pub/` that lead to `private/` (absolute, and relative
+/// within the workdir) and out of the workdir (absolute, and relative).
+/// Returns the workdir and the directory outside it.
+fn read_gate_workdir(name: &str) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    for dir in [temp_dir(name), temp_dir(&format!("{name}-outside"))] {
+        let _ = fs::remove_dir_all(&dir);
+    }
+    let workdir = temp_dir(name).canonicalize().unwrap();
+    let outside = temp_dir(&format!("{name}-outside")).canonicalize().unwrap();
+    for d in ["pub/d", "private/sub"] {
+        fs::create_dir_all(workdir.join(d)).unwrap();
+    }
+    fs::write(workdir.join("pub/readme.txt"), "public").unwrap();
+    fs::write(workdir.join("pub/d/inner.txt"), "inner").unwrap();
+    for f in READ_GATE_FILES {
+        let p = workdir.join(format!("private/{f}.txt"));
+        fs::write(&p, "TOP SECRET").unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    fs::write(workdir.join("private/hidden-name-in-private.txt"), "").unwrap();
+    fs::write(workdir.join("private/sub/deep.txt"), "NESTED SECRET").unwrap();
+    fs::write(outside.join("hidden-name-outside.txt"), "").unwrap();
+    symlink(workdir.join("private"), workdir.join("pub/lnk")).unwrap();
+    symlink(&outside, workdir.join("pub/lnk_out")).unwrap();
+    let outside_name = outside.file_name().unwrap().to_str().unwrap();
+    symlink(format!("../../{outside_name}"), workdir.join("pub/rel_out")).unwrap();
+    symlink("../private", workdir.join("pub/rel_in")).unwrap();
+    (workdir, outside)
+}
+
+/// Run every way a child has to make the COW layer read `private/` (or a
+/// directory a symlink under `pub/` leads to) for it, and print one
+/// `name=ok:<value>` or `name=err:<errno>` line per probe. A metadata change
+/// and the read after it are separate probes, so a change that reached the
+/// real file shows as `ok` even though Landlock then refuses the read.
+async fn run_read_gate_probes(workdir: &std::path::Path) -> String {
+    let policy = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/proc").fs_read("/dev")
+        .fs_read(workdir.join("pub"))
+        .workdir(workdir)
+        .cow_honor_read_grants(true)
+        .on_exit(BranchAction::Abort)
+        .build()
+        .unwrap();
+    let script = format!(concat!(
+        "import ctypes, os, platform, struct\n",
+        "W = '{wd}'\n",
+        "P = W + '/private/'\n",
+        "libc = ctypes.CDLL(None, use_errno=True)\n",
+        "libc.syscall.restype = ctypes.c_long\n",
+        "GETDENTS64 = 61 if platform.machine() in ('aarch64', 'riscv64') else 217\n",
+        "def probe(name, f):\n",
+        "    try:\n",
+        "        print(f'{{name}}=ok:{{f()!r}}')\n",
+        "    except OSError as e:\n",
+        "        print(f'{{name}}=err:{{e.errno}}')\n",
+        "def raw_getdents(fd):\n",
+        "    buf = ctypes.create_string_buffer(8192)\n",
+        "    n = libc.syscall(GETDENTS64, fd, buf, len(buf))\n",
+        "    if n < 0:\n",
+        "        e = ctypes.get_errno()\n",
+        "        raise OSError(e, os.strerror(e))\n",
+        "    names, off = [], 0\n",
+        "    while off < n:\n",
+        "        reclen = struct.unpack_from('H', buf.raw, off + 16)[0]\n",
+        "        name = buf.raw[off + 19:off + reclen].split(b'\\0', 1)[0].decode()\n",
+        "        if name not in ('.', '..'):\n",
+        "            names.append(name)\n",
+        "        off += reclen\n",
+        "    return sorted(names)\n",
+        "def list_by_opath(p):\n",
+        "    fd = os.open(p, os.O_PATH | os.O_NOFOLLOW)\n",
+        "    try:\n",
+        "        return raw_getdents(fd)\n",
+        "    finally:\n",
+        "        os.close(fd)\n",
+        "def list_by_plain_fd(p):\n",
+        "    fd = os.open(p, os.O_RDONLY)\n",
+        "    try:\n",
+        "        return sorted(os.listdir(fd))\n",
+        "    finally:\n",
+        "        os.close(fd)\n",
+        "def create(p):\n",
+        "    with open(p, 'w') as f:\n",
+        "        f.write('new')\n",
+        "    return open(p).read()\n",
+        "def append_then_read(p):\n",
+        "    with open(p, 'a') as f:\n",
+        "        f.write('+')\n",
+        "    return open(p).read()\n",
+        "probe('rdonly', lambda: open(P + 'secret.txt').read())\n",
+        "probe('rdwr', lambda: open(P + 'secret.txt', 'r+').read())\n",
+        "probe('trunc', lambda: open(P + 'trunc.txt', 'w').close())\n",
+        "probe('chmod', lambda: os.chmod(P + 'chmod.txt', 0o644))\n",
+        "probe('chmod_read', lambda: open(P + 'chmod.txt').read())\n",
+        "probe('chown', lambda: os.chown(P + 'chown.txt', -1, os.getgid()))\n",
+        "probe('chown_read', lambda: open(P + 'chown.txt').read())\n",
+        "probe('utime', lambda: os.utime(P + 'utime.txt', (0, 0)))\n",
+        "probe('utime_read', lambda: open(P + 'utime.txt').read())\n",
+        "probe('link', lambda: os.link(P + 'link.txt', W + '/pub/alias'))\n",
+        "probe('link_read', lambda: open(W + '/pub/alias').read())\n",
+        "probe('rename_dir', lambda: os.rename(P + 'sub', W + '/moved'))\n",
+        "probe('rename_read', lambda: (sorted(os.listdir(W + '/moved')), open(W + '/moved/deep.txt').read()))\n",
+        "probe('create', lambda: create(P + 'new.txt'))\n",
+        "probe('getdents_open', lambda: os.close(os.open(P, os.O_RDONLY)))\n",
+        "probe('getdents', lambda: list_by_plain_fd(P))\n",
+        "probe('lnk_opath', lambda: list_by_opath(W + '/pub/lnk'))\n",
+        "probe('lnk_out_opath', lambda: list_by_opath(W + '/pub/lnk_out'))\n",
+        "probe('rel_out_opath', lambda: list_by_opath(W + '/pub/rel_out'))\n",
+        "probe('rel_in_opath', lambda: list_by_opath(W + '/pub/rel_in'))\n",
+        "probe('lnk_create', lambda: create(W + '/pub/lnk/made.txt'))\n",
+        "probe('lnk_listing', lambda: list_by_plain_fd(W + '/pub/lnk'))\n",
+        "probe('pub_append', lambda: append_then_read(W + '/pub/readme.txt'))\n",
+        "probe('pub_rename_dir', lambda: sorted(os.rename(W + '/pub/d', W + '/pub/d2') or os.listdir(W + '/pub/d2')))\n",
+    ), wd = workdir.display());
+    let result = policy.clone().run(&["python3", "-I", "-c", &script]).await.unwrap();
+    assert!(result.success(), "exit={:?} stderr={}", result.code(), result.stderr_str().unwrap_or(""));
+    result.stdout_str().unwrap_or("").to_string()
+}
+
+/// Every path by which the COW layer would read `private/` on the child's
+/// behalf, or list a directory a lower symlink leads to, answers as Landlock
+/// answers a plain read: EACCES, or no lower names. A refusal never falls
+/// through to the kernel: the real files keep their content, mode, owner and
+/// times. Without the gate, `rdwr`, `chmod`, `chown`, `utime` and `link`
+/// expose the secret, `rename_dir` the subtree, and the listings the names
+/// under `private/` and outside the workdir.
+#[tokio::test]
+async fn test_cow_honor_read_grants_refuses_every_copy_up_path() {
+    use std::os::unix::fs::MetadataExt;
+    let (workdir, outside) = read_gate_workdir("read-gate");
+    let before: Vec<(PathBuf, fs::Metadata)> = READ_GATE_FILES
+        .iter()
+        .map(|f| workdir.join(format!("private/{f}.txt")))
+        .map(|p| (p.clone(), fs::metadata(&p).unwrap()))
+        .collect();
+    let out = run_read_gate_probes(&workdir).await;
+    let line = |name: &str| -> String {
+        out.lines()
+            .find_map(|l| l.strip_prefix(&format!("{name}=")))
+            .unwrap_or_else(|| panic!("no {name} line in: {out}"))
+            .to_string()
+    };
+    // Refused by the gate (the metadata changes Landlock does not mediate).
+    for name in ["rdwr", "trunc", "chmod", "chown", "utime", "link", "rename_dir", "getdents", "rel_in_opath"] {
+        assert_eq!(line(name), "err:13", "{name} must answer EACCES: {out}");
+    }
+    // Refused by Landlock, or absent because the operation before it was refused.
+    for name in ["rdonly", "chmod_read", "chown_read", "utime_read"] {
+        assert_eq!(line(name), "err:13", "{name}: {out}");
+    }
+    assert_eq!(line("link_read"), "err:2", "{out}");
+    assert_eq!(line("rename_read"), "err:2", "{out}");
+    // The plain-fd listing reaches the merged getdents (the open itself succeeds).
+    assert_eq!(line("getdents_open"), "ok:None", "{out}");
+    // A lower symlink cannot make the listing read another directory: a
+    // listing of the symlink itself shows no lower names, and one of the upper
+    // directory a create made there shows only what the child created.
+    for name in ["lnk_opath", "lnk_out_opath", "rel_out_opath"] {
+        assert_eq!(line(name), "ok:[]", "{name}: {out}");
+    }
+    assert_eq!(line("lnk_create"), "ok:'new'", "{out}");
+    assert_eq!(line("lnk_listing"), "ok:['made.txt']", "{out}");
+    assert!(!out.contains("SECRET"), "no secret byte reaches the child: {out}");
+    assert!(!out.contains("hidden-name"), "no lower name reaches the child: {out}");
+    // What the grants do cover keeps working, and a new file reveals nothing.
+    assert_eq!(line("create"), "ok:'new'");
+    assert_eq!(line("pub_append"), "ok:'public+'");
+    assert_eq!(line("pub_rename_dir"), "ok:['inner.txt']");
+
+    // A refusal never fell through to the kernel: the run's branch is aborted,
+    // so any change left on the real files would have bypassed it.
+    for (p, m) in &before {
+        let now = fs::metadata(p).unwrap();
+        assert_eq!(fs::read_to_string(p).unwrap(), "TOP SECRET", "{}", p.display());
+        assert_eq!(now.mode(), m.mode(), "mode of {}", p.display());
+        assert_eq!((now.uid(), now.gid()), (m.uid(), m.gid()), "owner of {}", p.display());
+        assert_eq!(now.mtime_nsec() + now.mtime() * 1_000_000_000, m.mtime_nsec() + m.mtime() * 1_000_000_000, "mtime of {}", p.display());
+        assert_eq!(now.ctime_nsec() + now.ctime() * 1_000_000_000, m.ctime_nsec() + m.ctime() * 1_000_000_000, "ctime of {}", p.display());
+    }
+    assert!(!workdir.join("pub/alias").exists());
+    assert!(workdir.join("private/sub/deep.txt").exists());
+    let _ = fs::remove_dir_all(&workdir);
+    let _ = fs::remove_dir_all(&outside);
+}
+
+/// The option belongs to the configurations whose grants mean what the gate
+/// checks: with chroot, or with a relative grant (Landlock resolves it against
+/// the child's working directory), it is refused rather than silently weak.
+#[test]
+fn test_cow_honor_read_grants_is_refused_where_it_cannot_hold() {
+    let workdir = temp_dir("read-gate-unsupported");
+    let err = Sandbox::builder()
+        .chroot("/")
+        .workdir(&workdir)
+        .cow_honor_read_grants(true)
+        .build()
+        .unwrap_err();
+    assert!(err.to_string().contains("not supported together with chroot"), "{err}");
+    let err = Sandbox::builder()
+        .fs_read("relative/dir")
+        .workdir(&workdir)
+        .cow_honor_read_grants(true)
+        .build()
+        .unwrap_err();
+    assert!(err.to_string().contains("absolute"), "{err}");
+    let _ = fs::remove_dir_all(&workdir);
+}

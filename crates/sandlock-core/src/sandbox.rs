@@ -187,6 +187,7 @@ impl TryFrom<&Sandbox> for Confinement {
         if sandbox.no_huge_pages { unsupported.push("no_huge_pages"); }
         if sandbox.no_coredump { unsupported.push("no_coredump"); }
         if sandbox.deterministic_dirs { unsupported.push("deterministic_dirs"); }
+        if sandbox.cow_honor_read_grants { unsupported.push("cow_honor_read_grants"); }
         if sandbox.workdir.is_some() { unsupported.push("workdir"); }
         if sandbox.cwd.is_some() { unsupported.push("cwd"); }
         if sandbox.fs_storage.is_some() { unsupported.push("fs_storage"); }
@@ -517,6 +518,9 @@ pub struct Sandbox {
     pub no_huge_pages: bool,
     pub no_coredump: bool,
     pub deterministic_dirs: bool,
+    /// `SandboxBuilder::cow_honor_read_grants`.
+    #[serde(default)]
+    pub cow_honor_read_grants: bool,
 
     /// The COW upper dir granted read+exec at spawn time so Landlock can
     /// execute binaries the workload creates in the workdir. An internal
@@ -667,6 +671,7 @@ impl Clone for Sandbox {
             no_huge_pages: self.no_huge_pages,
             no_coredump: self.no_coredump,
             deterministic_dirs: self.deterministic_dirs,
+            cow_honor_read_grants: self.cow_honor_read_grants,
             // Cloned for the control-loop snapshot, which is taken after the
             // spawn-time upper grant lands in fs_readable.
             cow_upper: self.cow_upper.clone(),
@@ -1817,6 +1822,16 @@ impl Sandbox {
         // environment itself is built right before fork, below.
         context::ChildEnv::validate(self).map_err(SandboxRuntimeError::Child)?;
 
+        // Again here, for a `Sandbox` not made by the builder: the gate is
+        // only sound for the configurations `check_supported` accepts.
+        if self.cow_honor_read_grants {
+            crate::cow::read_gate::check_supported(
+                self.chroot.is_some(),
+                self.fs_readable.iter().chain(self.fs_writable.iter()),
+            )
+            .map_err(SandboxRuntimeError::Child)?;
+        }
+
         // Resolve the chroot root eagerly, before any fork or confinement work:
         // a configured-but-missing chroot must be a hard error, never a silent
         // drop to "no confinement".
@@ -1940,6 +1955,13 @@ impl Sandbox {
                     branch.set_keep_if_abandoned(
                         self.on_exit == BranchAction::Keep || self.on_error == BranchAction::Keep,
                     );
+                    // Taken before the upper is granted below: the gate is the
+                    // caller's own grants.
+                    if self.cow_honor_read_grants {
+                        branch.set_read_gate(crate::cow::read_gate::CowReadGate::from_grants(
+                            self.fs_readable.iter().chain(self.fs_writable.iter()),
+                        ));
+                    }
                     self.fs_readable.push(branch.upper_dir().to_path_buf());
                     self.cow_upper = Some(branch.upper_dir().to_path_buf());
                     Some(branch)

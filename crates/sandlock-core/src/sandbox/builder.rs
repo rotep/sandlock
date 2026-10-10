@@ -141,6 +141,11 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", arg(long = "deterministic-dirs"))]
     pub deterministic_dirs: bool,
 
+    /// With `workdir`: make the copy-on-write layer honour the read grants.
+    /// See [`SandboxBuilder::cow_honor_read_grants`].
+    #[cfg_attr(feature = "cli", arg(long = "cow-honor-read-grants"))]
+    pub cow_honor_read_grants: bool,
+
     #[cfg_attr(feature = "cli", arg(long = "workdir"))]
     pub workdir: Option<PathBuf>,
 
@@ -286,6 +291,7 @@ impl Default for SandboxBuilder {
             no_huge_pages: false,
             no_coredump: false,
             deterministic_dirs: false,
+            cow_honor_read_grants: false,
             workdir: None,
             cwd: None,
             fs_storage: None,
@@ -351,6 +357,7 @@ impl Clone for SandboxBuilder {
             no_huge_pages: self.no_huge_pages,
             no_coredump: self.no_coredump,
             deterministic_dirs: self.deterministic_dirs,
+            cow_honor_read_grants: self.cow_honor_read_grants,
             workdir: self.workdir.clone(),
             cwd: self.cwd.clone(),
             fs_storage: self.fs_storage.clone(),
@@ -673,6 +680,32 @@ impl SandboxBuilder {
         self
     }
 
+    /// With `workdir`, the supervisor copies a lower file into the upper
+    /// when the child opens it for writing or changes its metadata, and
+    /// lists lower directories when it merges a directory listing. It does
+    /// both outside the child's Landlock ruleset, so by default a child can
+    /// read a workdir file its `fs_read`/`fs_write` grants do not cover (open
+    /// it `O_RDWR`, or `chmod` it and read the copy).
+    ///
+    /// With this set, the branch refuses with `EACCES` to copy up, or list
+    /// for the child, any existing lower entry whose real path is not under
+    /// an `fs_read` or `fs_write` grant (both canonicalized once, when the
+    /// branch is created). A merged listing reads the lower directory
+    /// confined to the workdir, so a lower symlink cannot lead it elsewhere.
+    /// Creating new files and writing to what is already in the upper are
+    /// unchanged. A write-mode open, `chmod`, `chown`, `utimensat`,
+    /// `truncate` (including to zero), `rename` or `link` of an ungranted
+    /// existing file now fails with `EACCES` instead of being staged.
+    ///
+    /// Needs absolute `fs_read`/`fs_write` paths and is not supported
+    /// together with `chroot`; `build()` refuses either. In a transaction the
+    /// branch is shared, so one stage setting it applies the grants of every
+    /// stage that set it to all stages.
+    pub fn cow_honor_read_grants(mut self, v: bool) -> Self {
+        self.cow_honor_read_grants = v;
+        self
+    }
+
     pub fn workdir(mut self, path: impl Into<PathBuf>) -> Self {
         self.workdir = Some(path.into());
         self
@@ -875,6 +908,14 @@ impl SandboxBuilder {
                  you wanted REFER enforced only where the kernel supports it)."
                     .into(),
             ));
+        }
+
+        if self.cow_honor_read_grants {
+            crate::cow::read_gate::check_supported(
+                self.chroot.is_some(),
+                self.fs_readable.iter().chain(self.fs_writable.iter()),
+            )
+            .map_err(SandboxError::Invalid)?;
         }
 
         // An image rootfs is a cache entry every sandbox of that image shares,
@@ -1103,6 +1144,7 @@ impl SandboxBuilder {
             no_huge_pages: self.no_huge_pages,
             no_coredump: self.no_coredump,
             deterministic_dirs: self.deterministic_dirs,
+            cow_honor_read_grants: self.cow_honor_read_grants,
             workdir: self.workdir,
             cwd: self.cwd,
             fs_storage: self.fs_storage,

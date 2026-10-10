@@ -24,7 +24,7 @@
 //! provided by Landlock (or by the chroot dispatcher, when chroot mode
 //! is active and runs before COW).
 
-use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -212,7 +212,7 @@ pub(crate) async fn handle_cow_open(
     let mut path = resolve_at_path_with_virtual(notif, dirfd, &rel_path, virtual_cwd.as_deref());
 
     // Phase 1: determine plan under lock (no heavy I/O)
-    let (plan, upper_root, workdir_root) = {
+    let (plan, upper_root, workdir_root, gate) = {
         let mut st = cow_state.lock().await;
         let cow = match st.branch.as_mut() {
             Some(c) => c,
@@ -220,6 +220,7 @@ pub(crate) async fn handle_cow_open(
         };
         let upper_root = cow.upper_dir().to_path_buf();
         let workdir_root = cow.workdir().to_path_buf();
+        let gate = cow.read_gate().clone();
 
         path = map_cow_upper_path(cow, &path);
         if !cow.matches(&path) {
@@ -244,7 +245,7 @@ pub(crate) async fn handle_cow_open(
             Err(crate::error::BranchError::Exists) => return NotifAction::Errno(libc::EEXIST),
             Err(_) => return NotifAction::Continue,
         };
-        (plan, upper_root, workdir_root)
+        (plan, upper_root, workdir_root, gate)
     };
     // Lock is released here
 
@@ -262,7 +263,7 @@ pub(crate) async fn handle_cow_open(
             let uroot = upper_root.clone();
             let rel = rel_path.clone();
             let copy_result = tokio::task::spawn_blocking(move || {
-                crate::cow::seccomp::SeccompCowBranch::execute_copy(&root, &uroot, &rel)
+                crate::cow::seccomp::SeccompCowBranch::execute_copy(&root, &uroot, &rel, &gate)
             }).await;
 
             match copy_result {
@@ -274,6 +275,15 @@ pub(crate) async fn handle_cow_open(
                         }
                     }
                     upper
+                }
+                // Outside the read grants: answer as Landlock would. Never
+                // Continue — the kernel would open the real lower file.
+                Ok(Err(e)) if crate::cow::read_gate::is_not_granted(&e) => {
+                    let mut st = cow_state.lock().await;
+                    if let Some(cow) = st.branch.as_mut() {
+                        cow.rollback_copy(file_size);
+                    }
+                    return NotifAction::Errno(libc::EACCES);
                 }
                 Ok(Err(_)) | Err(_) => {
                     // Copy failed — roll back quota and let kernel handle it
@@ -501,6 +511,9 @@ fn cow_result(r: Result<bool, crate::error::BranchError>) -> NotifAction {
         // Whiteouted source: Continue would let the kernel act on the lower
         // entry, which still exists with its pre-delete content.
         Err(crate::error::BranchError::Deleted) => NotifAction::Errno(libc::ENOENT),
+        // Never Continue: the kernel would apply chmod/chown to the real lower
+        // file, which Landlock does not restrict.
+        Err(crate::error::BranchError::NotGranted) => NotifAction::Errno(libc::EACCES),
         Err(crate::error::BranchError::NotOwned) => NotifAction::Continue,
         _ => NotifAction::Continue,
     }
@@ -539,6 +552,14 @@ fn cow_copy_rel<'a>(
         .map(|rel| (match_path, rel))
 }
 
+/// Why a deferred copy did not land in the upper.
+enum DeferredCopyFailure {
+    /// The read gate refused the source: answer `EACCES`, never `Continue`.
+    NotGranted,
+    /// Any other failure: the caller keeps its `Continue` fallback.
+    Failed,
+}
+
 /// Execute a deferred `CowCopyPlan::NeedsCopy` on a blocking thread.
 /// Returns the upper path on success, or rolls back quota on failure.
 async fn execute_deferred_copy(
@@ -548,10 +569,11 @@ async fn execute_deferred_copy(
     rel: String,
     upper: std::path::PathBuf,
     file_size: u64,
-) -> Option<std::path::PathBuf> {
+    gate: crate::cow::read_gate::CowReadGate,
+) -> Result<std::path::PathBuf, DeferredCopyFailure> {
     let rel_path = rel.clone();
     let copy_result = tokio::task::spawn_blocking(move || {
-        crate::cow::seccomp::SeccompCowBranch::execute_copy(&workdir_root, &upper_root, &rel)
+        crate::cow::seccomp::SeccompCowBranch::execute_copy(&workdir_root, &upper_root, &rel, &gate)
     }).await;
     match copy_result {
         Ok(Ok(digest)) => {
@@ -561,14 +583,17 @@ async fn execute_deferred_copy(
                     cow.record_digest(&rel_path, d);
                 }
             }
-            Some(upper)
+            Ok(upper)
         }
-        _ => {
+        failed => {
             let mut st = cow_state.lock().await;
             if let Some(cow) = st.branch.as_mut() {
                 cow.rollback_copy(file_size);
             }
-            None
+            match failed {
+                Ok(Err(e)) if crate::cow::read_gate::is_not_granted(&e) => Err(DeferredCopyFailure::NotGranted),
+                _ => Err(DeferredCopyFailure::Failed),
+            }
         }
     }
 }
@@ -595,12 +620,13 @@ pub(crate) async fn handle_cow_write(
 
     // Phase 1: check if we need to pre-copy a file (under lock, no heavy I/O).
     // Capture both layer roots here so Phase 2 needs no second lock.
-    let (copy_plan, copy_workdir, copy_upper, copy_rel) = {
+    let (copy_plan, copy_workdir, copy_upper, copy_rel, copy_gate) = {
         let mut st = cow_state.lock().await;
         let cow = match st.branch.as_mut() {
             Some(c) => c,
             None => return NotifAction::Continue,
         };
+        let gate = cow.read_gate().clone();
 
         op.remap_upper_paths(cow);
         match cow_copy_rel(&op, cow) {
@@ -608,7 +634,7 @@ pub(crate) async fn handle_cow_write(
                 let workdir = cow.workdir().to_path_buf();
                 let upper = cow.upper_dir().to_path_buf();
                 match cow.prepare_copy(rel) {
-                    Ok(plan) => (Some(plan), workdir, upper, rel.clone()),
+                    Ok(plan) => (Some(plan), workdir, upper, rel.clone(), gate),
                     Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
                     // A kernel object: its metadata is the kernel's to change,
                     // but it cannot be staged under a new name.
@@ -623,15 +649,19 @@ pub(crate) async fn handle_cow_write(
                     Err(_) => return NotifAction::Continue,
                 }
             }
-            None => (None, std::path::PathBuf::new(), std::path::PathBuf::new(), String::new()),
+            None => (None, std::path::PathBuf::new(), std::path::PathBuf::new(), String::new(), gate),
         }
     };
     // Lock is released here
 
     // Phase 2: execute the file copy outside the lock (if needed)
     if let Some(crate::cow::seccomp::CowCopyPlan::NeedsCopy { upper, lower: _lower, file_size }) = copy_plan {
-        if execute_deferred_copy(cow_state, copy_workdir, copy_upper, copy_rel, upper, file_size).await.is_none() {
-            return NotifAction::Continue;
+        match execute_deferred_copy(cow_state, copy_workdir, copy_upper, copy_rel, upper, file_size, copy_gate).await {
+            Ok(_) => {}
+            // Never Continue here: chmod/chown/rename/link would then act on
+            // the real lower file, and Landlock does not restrict chmod/chown.
+            Err(DeferredCopyFailure::NotGranted) => return NotifAction::Errno(libc::EACCES),
+            Err(DeferredCopyFailure::Failed) => return NotifAction::Continue,
         }
     }
 
@@ -804,6 +834,9 @@ pub(crate) async fn handle_cow_utimensat(
             Ok(Some(p)) => p,
             Ok(None) => return NotifAction::Continue,
             Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
+            // Never Continue: Landlock does not restrict utimensat, so the
+            // kernel would set the times on the real lower file.
+            Err(crate::error::BranchError::NotGranted) => return NotifAction::Errno(libc::EACCES),
             Err(_) => return NotifAction::Continue,
         };
         (p, upper_root, workdir_root)
@@ -1194,7 +1227,7 @@ pub(crate) async fn handle_cow_getdents(
 
     // Compute rel_path under the global COW lock, but do not hold it
     // across the per-process lock acquired below.
-    let rel_path = {
+    let (rel_path, gated_lower) = {
         let st = cow_state.lock().await;
         let cow = match st.branch.as_ref() {
             Some(c) => c,
@@ -1204,7 +1237,7 @@ pub(crate) async fn handle_cow_getdents(
             return NotifAction::Continue;
         }
         let target_path = Path::new(&target);
-        if cow.matches(&target) {
+        let rel = if cow.matches(&target) {
             cow.safe_rel(&target).unwrap_or_else(|| ".".to_string())
         } else if let Ok(rel) = target_path.strip_prefix(cow.upper_dir()) {
             let rel = rel.to_string_lossy();
@@ -1215,7 +1248,21 @@ pub(crate) async fn handle_cow_getdents(
             }
         } else {
             return NotifAction::Continue;
-        }
+        };
+        // The merged listing carries the lower directory's names. The child's
+        // descriptor may be an upper directory the branch handed it, or an
+        // O_PATH one Landlock does not check, so judge the lower directory
+        // itself, and list it from the very descriptor judged: `None` keeps
+        // the ungated listing, `Some(None)` shows no lower names.
+        let gated_lower = if cow.read_gate().is_enabled() {
+            match cow.open_gated_lower_dir(&rel) {
+                Ok(lower) => Some(lower),
+                Err(errno) => return NotifAction::Errno(errno),
+            }
+        } else {
+            None
+        };
+        (rel, gated_lower)
     };
 
     // Per-process dir cache lookup.
@@ -1244,9 +1291,19 @@ pub(crate) async fn handle_cow_getdents(
                 Some(c) => c,
                 None => return NotifAction::Continue,
             };
-            let merged = cow.list_merged_dir(&rel_path);
             let upper_dir = cow.upper_dir().join(&rel_path);
-            let lower_dir = cow.workdir().join(&rel_path);
+            let (merged, lower_dir) = match &gated_lower {
+                None => (cow.list_merged_dir(&rel_path), cow.workdir().join(&rel_path)),
+                // Types and inodes come from the judged descriptor too; with
+                // no lower directory every name is an upper one.
+                Some(lower) => (
+                    cow.list_merged_dir_from(&rel_path, lower.as_ref()),
+                    lower
+                        .as_ref()
+                        .map(|dir| PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd())))
+                        .unwrap_or_else(|| upper_dir.clone()),
+                ),
+            };
 
             let mut out = Vec::new();
             let mut d_off: i64 = 0;
