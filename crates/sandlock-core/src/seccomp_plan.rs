@@ -155,6 +155,17 @@ fn cow_path_syscalls() -> Vec<i64> {
         libc::SYS_fchownat,
         libc::SYS_truncate,
         libc::SYS_utimensat,
+        // Metadata on a descriptor and path-based xattr: Landlock does not
+        // restrict these, so under COW the supervisor must mediate them to
+        // keep a metadata change off the real lower file (ADR-0012 Update 8).
+        libc::SYS_fchmod,
+        libc::SYS_fchown,
+        libc::SYS_fsetxattr,
+        libc::SYS_fremovexattr,
+        libc::SYS_setxattr,
+        libc::SYS_lsetxattr,
+        libc::SYS_removexattr,
+        libc::SYS_lremovexattr,
         libc::SYS_newfstatat,
         libc::SYS_statx,
         libc::SYS_faccessat,
@@ -179,6 +190,9 @@ fn cow_path_syscalls() -> Vec<i64> {
             arch::sys_chmod(),
             arch::sys_chown(),
             arch::sys_lchown(),
+            arch::sys_utime(),
+            arch::sys_utimes(),
+            arch::sys_futimesat(),
             arch::sys_stat(),
             arch::sys_lstat(),
             arch::sys_access(),

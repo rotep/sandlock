@@ -144,6 +144,19 @@ pub enum BranchError {
     /// lower file, which Landlock does not restrict.
     #[error("lower entry is outside the sandbox's read grants")]
     NotGranted,
+
+    /// A metadata op (`chmod`/`chown`/`truncate`/`utimensat`/`setxattr`...)
+    /// named a symlink whose target leaves the workspace. Answered `EACCES`;
+    /// never `Continue`, which would let the kernel act on the real target.
+    #[error("metadata target escapes the workspace")]
+    Escapes,
+
+    /// A metadata op's copy-up or apply to the upper layer failed. Answered
+    /// with an errno (`EIO`), never `Continue`: the kernel would otherwise
+    /// apply the change to the real lower file, which Landlock does not
+    /// restrict for metadata (mode/owner/time/xattr).
+    #[error("metadata apply to the branch failed")]
+    MetaApply,
 }
 
 /// Convenience type alias.

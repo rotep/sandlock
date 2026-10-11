@@ -1036,6 +1036,19 @@ fn register_cow_handlers(table: &mut DispatchTable, ctx: &Arc<SupervisorCtx>) {
 
     table.register(libc::SYS_utimensat, cow_call!(crate::cow::dispatch::handle_cow_utimensat));
 
+    // Metadata on a descriptor (fchmod/fchown/fsetxattr/fremovexattr).
+    for &nr in &[libc::SYS_fchmod, libc::SYS_fchown, libc::SYS_fsetxattr, libc::SYS_fremovexattr] {
+        table.register(nr, cow_call!(crate::cow::dispatch::handle_cow_meta_fd));
+    }
+    // Path-based xattr (set/remove, follow and l* no-follow).
+    for &nr in &[libc::SYS_setxattr, libc::SYS_lsetxattr, libc::SYS_removexattr, libc::SYS_lremovexattr] {
+        table.register(nr, cow_call!(crate::cow::dispatch::handle_cow_setxattr));
+    }
+    // Legacy time ops (utime/utimes/futimesat) on arches that have them.
+    for nr in [arch::sys_utime(), arch::sys_utimes(), arch::sys_futimesat()].into_iter().flatten() {
+        table.register(nr, cow_call!(crate::cow::dispatch::handle_cow_utimes));
+    }
+
     let mut access_nrs = vec![libc::SYS_faccessat, arch::SYS_FACCESSAT2];
     access_nrs.extend(arch::sys_access());
     for nr in access_nrs {

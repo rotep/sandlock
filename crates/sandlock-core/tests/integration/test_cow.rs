@@ -1758,3 +1758,160 @@ fn test_cow_honor_read_grants_is_refused_where_it_cannot_hold() {
     assert!(err.to_string().contains("absolute"), "{err}");
     let _ = fs::remove_dir_all(&workdir);
 }
+
+// ============================================================
+// --defer-effects: a metadata change (mode/owner/time/xattr) on a workspace
+// file is held in the branch and never lands on the real lower file — through
+// a symlink, a descriptor, a /proc/self/fd magic link, or a legacy syscall.
+// ============================================================
+
+/// Run every metadata vector and print one `name=ok:…`/`name=err:<errno>`
+/// line each. `gate` toggles `cow_honor_read_grants`; with it off and the
+/// whole workspace granted (the common `-w $W` setup) the vectors must still
+/// not reach the real file.
+async fn run_metadata_probes(workdir: &std::path::Path, outside: &std::path::Path, gate: bool) -> String {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    for (name, mode) in [("direct", 0o600u32)] {
+        let _ = name; let _ = mode;
+    }
+    fs::create_dir_all(workdir.join("pub")).unwrap();
+    fs::create_dir_all(workdir.join("private")).unwrap();
+    fs::write(workdir.join("pub/readme.txt"), "public").unwrap();
+    fs::write(workdir.join("pub/granted.txt"), "g").unwrap();
+    fs::set_permissions(workdir.join("pub/granted.txt"), fs::Permissions::from_mode(0o600)).unwrap();
+    for f in ["c", "t", "o", "u", "x", "fd"] {
+        let p = workdir.join(format!("private/{f}.txt"));
+        fs::write(&p, "SECRET").unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    fs::write(outside.join("host.txt"), "OUT").unwrap();
+    fs::set_permissions(outside.join("host.txt"), fs::Permissions::from_mode(0o600)).unwrap();
+    let _ = fs::remove_file(workdir.join("pub/lnk_c"));
+    let _ = fs::remove_file(workdir.join("pub/lnk_host"));
+    symlink("../private/c.txt", workdir.join("pub/lnk_c")).unwrap();
+    symlink(outside.join("host.txt"), workdir.join("pub/lnk_host")).unwrap();
+
+    let mut b = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/proc").fs_read("/dev")
+        .workdir(workdir)
+        .cwd(workdir)
+        .on_exit(BranchAction::Abort);
+    // gate on: grant only pub. gate off: grant the whole workspace (so the
+    // child can even open private/ read-only), as the common -w $W setup does.
+    b = if gate { b.fs_read(workdir.join("pub")).cow_honor_read_grants(true) } else { b.fs_read(workdir) };
+    let policy = b.build().unwrap();
+
+    let script = format!(concat!(
+        "import ctypes, os, platform, sys\n",
+        "W = '{wd}'\n",
+        "P = W + '/private/'\n",
+        "libc = ctypes.CDLL(None, use_errno=True); libc.syscall.restype = ctypes.c_long\n",
+        "def pr(n, f):\n",
+        "    try: print(f'{{n}}=ok:{{f()!r}}')\n",
+        "    except OSError as e: print(f'{{n}}=err:{{e.errno}}')\n",
+        "def fdop(p, op):\n",
+        "    fd = os.open(p, os.O_RDONLY)\n",
+        "    try: return op(fd)\n",
+        "    finally: os.close(fd)\n",
+        "def opath_chmod(p):\n",
+        "    fd = os.open(p, os.O_PATH)\n",
+        "    try: os.chmod(f'/proc/self/fd/{{fd}}', 0o644)\n",
+        "    finally: os.close(fd)\n",
+        "def raw_utimes(p):\n",
+        "    nr = 235 if platform.machine() == 'x86_64' else None\n",
+        "    if nr is None: return 'skip'\n",
+        "    r = libc.syscall(nr, p.encode(), None)\n",
+        "    if r < 0:\n",
+        "        e = ctypes.get_errno(); raise OSError(e, os.strerror(e))\n",
+        "def new_create_chmod(p):\n",
+        "    open(p, 'w').write('x'); os.chmod(p, 0o640); return oct(os.stat(p).st_mode & 0o777)\n",
+        "def new_fchmod(p):\n",
+        "    fd = os.open(p, os.O_WRONLY | os.O_CREAT, 0o600)\n",
+        "    try: os.fchmod(fd, 0o640); return 'ok'\n",
+        "    finally: os.close(fd)\n",
+        "pr('sym_chmod', lambda: os.chmod(W + '/pub/lnk_c', 0o644))\n",
+        "pr('sym_host_chmod', lambda: os.chmod(W + '/pub/lnk_host', 0o644))\n",
+        "pr('fchmod', lambda: fdop(P + 'fd.txt', lambda fd: os.fchmod(fd, 0o644)))\n",
+        "pr('fsetxattr', lambda: fdop(P + 'fd.txt', lambda fd: os.setxattr(fd, 'user.x', b'1')))\n",
+        "pr('futimens', lambda: fdop(P + 'u.txt', lambda fd: os.utime(fd, (0, 0))))\n",
+        "pr('setxattr', lambda: os.setxattr(P + 'x.txt', 'user.y', b'2'))\n",
+        "pr('utimes', lambda: raw_utimes(P + 'u.txt'))\n",
+        "pr('opath_chmod', lambda: opath_chmod(P + 'c.txt'))\n",
+        // /proc magic links that resolve, in the child's view, to a lower
+        // workspace file: must not reach the real file (ADR-0012 Update 8).
+        "pr('proc_self_root', lambda: os.chmod('/proc/self/root' + P + 'o.txt', 0o644))\n",
+        "pr('proc_self_cwd_t', lambda: os.chmod('/proc/self/cwd/private/t.txt', 0o644))\n",
+        "pr('threadself_root', lambda: os.chmod('/proc/thread-self/root' + P + 'u.txt', 0o644))\n",
+        // In the single-threaded probe, the main thread's tid == pid.\n
+        "pr('taskfd_chmod', lambda: fdop(P + 'x.txt', lambda fd: os.chmod('/proc/self/task/%d/fd/%d' % (os.getpid(), fd), 0o644)))\n",
+        "pr('ctl_new_chmod', lambda: new_create_chmod(W + '/pub/newf.txt'))\n",
+        "pr('ctl_new_fchmod', lambda: new_fchmod(W + '/pub/newf2.txt'))\n",
+        "pr('ctl_granted_chmod', lambda: (os.chmod(W + '/pub/granted.txt', 0o640), 'ok')[-1])\n",
+    ), wd = workdir.display());
+    let result = policy.clone().run(&["python3", "-I", "-c", &script]).await.unwrap();
+    assert!(result.success(), "exit={:?} stderr={}", result.code(), result.stderr_str().unwrap_or(""));
+    result.stdout_str().unwrap_or("").to_string()
+}
+
+/// Shared assertions: no vector reaches the real file; controls still work.
+fn assert_metadata_probes(out: &str, workdir: &std::path::Path, outside: &std::path::Path) {
+    use std::os::unix::fs::MetadataExt;
+    let get = |n: &str| out.lines().find_map(|l| l.strip_prefix(&format!("{n}="))).unwrap_or_else(|| panic!("no {n}: {out}")).to_string();
+    // Every escape vector is denied (EACCES or EPERM), or deferred ok without
+    // touching the real file (checked below).
+    for n in ["sym_host_chmod", "fchmod", "fsetxattr", "futimens", "opath_chmod"] {
+        let v = get(n);
+        assert!(v.starts_with("err:"), "{n} must be denied, got {v}: {out}");
+    }
+    // Controls work.
+    assert_eq!(get("ctl_new_chmod"), "ok:'0o640'", "{out}");
+    assert_eq!(get("ctl_new_fchmod"), "ok:'ok'", "{out}");
+    assert_eq!(get("ctl_granted_chmod"), "ok:'ok'", "{out}");
+    // The real files are untouched: modes 0600, no xattrs, times unchanged.
+    for f in ["c", "t", "o", "u", "x", "fd"] {
+        let p = workdir.join(format!("private/{f}.txt"));
+        let m = fs::metadata(&p).unwrap();
+        assert_eq!(m.mode() & 0o777, 0o600, "mode of {}: {out}", p.display());
+        assert_eq!(fs::read_to_string(&p).unwrap(), "SECRET", "{}", p.display());
+        assert!(xattr_names(&p).is_empty(), "xattr on {}: {out}", p.display());
+    }
+    let host = outside.join("host.txt");
+    assert_eq!(fs::metadata(&host).unwrap().mode() & 0o777, 0o600, "host mode: {out}");
+}
+
+/// `listxattr` on a path (user namespace), as a sorted Vec. Empty when none.
+fn xattr_names(p: &std::path::Path) -> Vec<String> {
+    use std::ffi::CString;
+    let c = CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+    let len = unsafe { libc::listxattr(c.as_ptr(), std::ptr::null_mut(), 0) };
+    if len <= 0 { return Vec::new(); }
+    let mut buf = vec![0i8; len as usize];
+    let got = unsafe { libc::listxattr(c.as_ptr(), buf.as_mut_ptr(), buf.len()) };
+    if got <= 0 { return Vec::new(); }
+    let bytes: Vec<u8> = buf[..got as usize].iter().map(|&b| b as u8).collect();
+    bytes.split(|&b| b == 0).filter(|s| !s.is_empty()).map(|s| String::from_utf8_lossy(s).into_owned()).collect()
+}
+
+#[tokio::test]
+async fn test_defer_effects_holds_metadata_off_the_real_file_with_gate() {
+    let workdir = temp_dir("meta-gate").canonicalize().unwrap();
+    let outside = temp_dir("meta-gate-out").canonicalize().unwrap();
+    let out = run_metadata_probes(&workdir, &outside, true).await;
+    assert_metadata_probes(&out, &workdir, &outside);
+    let _ = fs::remove_dir_all(&workdir);
+    let _ = fs::remove_dir_all(&outside);
+}
+
+#[tokio::test]
+async fn test_defer_effects_holds_metadata_off_the_real_file_without_gate() {
+    // The common `-w $W` setup (no read gate): the child can open private/
+    // read-only, so the fd/opath routes are genuinely exercised. The metadata
+    // interception must still keep every change off the real file.
+    let workdir = temp_dir("meta-nogate").canonicalize().unwrap();
+    let outside = temp_dir("meta-nogate-out").canonicalize().unwrap();
+    let out = run_metadata_probes(&workdir, &outside, false).await;
+    assert_metadata_probes(&out, &workdir, &outside);
+    let _ = fs::remove_dir_all(&workdir);
+    let _ = fs::remove_dir_all(&outside);
+}

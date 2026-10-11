@@ -74,6 +74,9 @@ legacy_syscall!(sys_link, "link");
 legacy_syscall!(sys_chmod, "chmod");
 legacy_syscall!(sys_chown, "chown");
 legacy_syscall!(sys_lchown, "lchown");
+legacy_syscall!(sys_utime, "utime");
+legacy_syscall!(sys_utimes, "utimes");
+legacy_syscall!(sys_futimesat, "futimesat");
 legacy_syscall!(sys_vfork, "vfork");
 legacy_syscall!(sys_fork, "fork");
 

@@ -537,6 +537,62 @@ pub(crate) fn chown_in_root(root: &Path, rel: &str, uid: u32, gid: u32) -> Resul
     }
 }
 
+/// `setxattr` a path confined within `root`, via the confined `O_PATH`
+/// handle's `/proc/self/fd` magic link. `follow` selects whether the final
+/// symlink is followed (`setxattr`) or the link itself is named (`lsetxattr`).
+pub(crate) fn setxattr_in_root(
+    root: &Path,
+    rel: &str,
+    name: &str,
+    value: &[u8],
+    flags: i32,
+    follow: bool,
+) -> Result<(), i32> {
+    let fd = opath_in_root(root, rel, follow)?;
+    let proc = CString::new(format!("/proc/self/fd/{}", fd)).map_err(|_| {
+        unsafe { libc::close(fd) };
+        libc::EINVAL
+    })?;
+    let c_name = CString::new(name).map_err(|_| {
+        unsafe { libc::close(fd) };
+        libc::EINVAL
+    })?;
+    let rc = unsafe {
+        libc::setxattr(
+            proc.as_ptr(),
+            c_name.as_ptr(),
+            value.as_ptr() as *const libc::c_void,
+            value.len(),
+            flags,
+        )
+    };
+    let err = last_errno(libc::EIO);
+    unsafe { libc::close(fd) };
+    if rc < 0 { Err(err) } else { Ok(()) }
+}
+
+/// `removexattr` a path confined within `root` (see [`setxattr_in_root`]).
+pub(crate) fn removexattr_in_root(
+    root: &Path,
+    rel: &str,
+    name: &str,
+    follow: bool,
+) -> Result<(), i32> {
+    let fd = opath_in_root(root, rel, follow)?;
+    let proc = CString::new(format!("/proc/self/fd/{}", fd)).map_err(|_| {
+        unsafe { libc::close(fd) };
+        libc::EINVAL
+    })?;
+    let c_name = CString::new(name).map_err(|_| {
+        unsafe { libc::close(fd) };
+        libc::EINVAL
+    })?;
+    let rc = unsafe { libc::removexattr(proc.as_ptr(), c_name.as_ptr()) };
+    let err = last_errno(libc::EIO);
+    unsafe { libc::close(fd) };
+    if rc < 0 { Err(err) } else { Ok(()) }
+}
+
 // ============================================================
 // File-handle identity (non-chroot fs-deny path)
 // ============================================================

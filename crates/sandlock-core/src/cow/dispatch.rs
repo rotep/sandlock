@@ -513,7 +513,9 @@ fn cow_result(r: Result<bool, crate::error::BranchError>) -> NotifAction {
         Err(crate::error::BranchError::Deleted) => NotifAction::Errno(libc::ENOENT),
         // Never Continue: the kernel would apply chmod/chown to the real lower
         // file, which Landlock does not restrict.
-        Err(crate::error::BranchError::NotGranted) => NotifAction::Errno(libc::EACCES),
+        Err(crate::error::BranchError::NotGranted)
+        | Err(crate::error::BranchError::Escapes) => NotifAction::Errno(libc::EACCES),
+        Err(crate::error::BranchError::MetaApply) => NotifAction::Errno(libc::EIO),
         Err(crate::error::BranchError::NotOwned) => NotifAction::Continue,
         _ => NotifAction::Continue,
     }
@@ -618,6 +620,23 @@ pub(crate) async fn handle_cow_write(
         None => return NotifAction::Continue,
     };
 
+    // A metadata op can name its target through the `/proc`/`/dev/fd` magic
+    // namespace, which resolves (in the child's view) to a real inode that may
+    // be a lower workspace file even though the literal path is not under the
+    // workdir. Resolve it before the workspace classification: a descriptor
+    // is gated like the fd route, a magic path that resolves to a real path is
+    // rewritten to it, and a form we cannot resolve fails closed.
+    if let CowWriteOp::Chmod { path, .. }
+        | CowWriteOp::Chown { path, .. }
+        | CowWriteOp::Truncate { path, .. } = &mut op
+    {
+        match resolve_child_meta_path(path, notif.pid) {
+            MetaPath::Fd { pid, fd } => return gate_cow_fd_metadata(cow_state, pid, fd).await,
+            MetaPath::Refuse => return NotifAction::Errno(libc::EACCES),
+            MetaPath::Path(real) => *path = real,
+        }
+    }
+
     // Phase 1: check if we need to pre-copy a file (under lock, no heavy I/O).
     // Capture both layer roots here so Phase 2 needs no second lock.
     let (copy_plan, copy_workdir, copy_upper, copy_rel, copy_gate) = {
@@ -661,7 +680,18 @@ pub(crate) async fn handle_cow_write(
             // Never Continue here: chmod/chown/rename/link would then act on
             // the real lower file, and Landlock does not restrict chmod/chown.
             Err(DeferredCopyFailure::NotGranted) => return NotifAction::Errno(libc::EACCES),
-            Err(DeferredCopyFailure::Failed) => return NotifAction::Continue,
+            // A failed copy-up (e.g. the COW store is full) must still not let
+            // the kernel apply a metadata change to the real lower file, which
+            // Landlock does not restrict (ADR-0012 Update 8). rename/link keep
+            // the documented Continue fallback.
+            Err(DeferredCopyFailure::Failed) => {
+                return match op {
+                    CowWriteOp::Chmod { .. } | CowWriteOp::Chown { .. } | CowWriteOp::Truncate { .. } => {
+                        NotifAction::Errno(libc::EIO)
+                    }
+                    _ => NotifAction::Continue,
+                }
+            }
         }
     }
 
@@ -808,8 +838,11 @@ pub(crate) async fn handle_cow_utimensat(
     let times_ptr = notif.data.args[2];
     let flags = notif.data.args[3] as i32;
 
+    // utimensat(dirfd, NULL, ...) stamps the open file `dirfd` — a fd-route
+    // metadata op. Gate it like the other fd-route ops so a descriptor for a
+    // lower workspace file cannot be stamped (ADR-0012 Update 8).
     if path_ptr == 0 {
-        return NotifAction::Continue;
+        return gate_cow_fd_metadata(cow_state, notif.pid, dirfd).await;
     }
 
     let virtual_cwd = current_virtual_cwd(processes, notif.pid).await;
@@ -817,32 +850,15 @@ pub(crate) async fn handle_cow_utimensat(
         Some(p) => resolve_at_path_with_virtual(notif, dirfd, &p, virtual_cwd.as_deref()),
         None => return NotifAction::Continue,
     };
-
-    let (upper_path, upper_root, workdir_root) = {
-        let mut st = cow_state.lock().await;
-        let cow = match st.branch.as_mut() {
-            Some(c) => c,
-            None => return NotifAction::Continue,
-        };
-        let upper_root = cow.upper_dir().to_path_buf();
-        let workdir_root = cow.workdir().to_path_buf();
-        let path = map_cow_upper_path(cow, &path);
-        if !cow.matches(&path) {
-            return NotifAction::Continue;
-        }
-        let p = match cow.handle_utimensat(&path) {
-            Ok(Some(p)) => p,
-            Ok(None) => return NotifAction::Continue,
-            Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
-            // Never Continue: Landlock does not restrict utimensat, so the
-            // kernel would set the times on the real lower file.
-            Err(crate::error::BranchError::NotGranted) => return NotifAction::Errno(libc::EACCES),
-            Err(_) => return NotifAction::Continue,
-        };
-        (p, upper_root, workdir_root)
+    let path = match resolve_child_meta_path(&path, notif.pid) {
+        MetaPath::Fd { pid, fd } => return gate_cow_fd_metadata(cow_state, pid, fd).await,
+        MetaPath::Refuse => return NotifAction::Errno(libc::EACCES),
+        MetaPath::Path(real) => real,
     };
+    let follow = (flags & libc::AT_SYMLINK_NOFOLLOW) == 0;
 
-    // Read times from child memory (2 x struct timespec = 32 bytes on x86_64)
+    // Read times from child memory (2 x struct timespec = 32 bytes) before
+    // taking the lock.
     let times = if times_ptr != 0 {
         match read_child_mem(notif_fd, notif.id, notif.pid, times_ptr, 32) {
             Ok(data) => {
@@ -858,13 +874,334 @@ pub(crate) async fn handle_cow_utimensat(
         None
     };
 
-    let (root, rel) = match pick_root_rel(&upper_root, &workdir_root, &upper_path) {
-        Ok(v) => v,
-        Err(e) => return NotifAction::Errno(e),
+    let mut st = cow_state.lock().await;
+    let cow = match st.branch.as_mut() {
+        Some(c) => c,
+        None => return NotifAction::Continue,
+    };
+    let upper_root = cow.upper_dir().to_path_buf();
+    let path = map_cow_upper_path(cow, &path);
+    if !cow.matches(&path) {
+        return NotifAction::Continue;
+    }
+    // Stage the (symlink-resolved) target into the upper, then stamp that
+    // entry with AT_SYMLINK_NOFOLLOW: `handle_utimensat` already followed the
+    // symlink in the merged view, so the target is a regular entry (or, for a
+    // no-follow request, the symlink copied verbatim).
+    let target = match cow.handle_utimensat(&path, follow) {
+        Ok(Some(t)) => t,
+        Ok(None) => return NotifAction::Continue,
+        Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
+        Err(crate::error::BranchError::NotGranted)
+        | Err(crate::error::BranchError::Escapes) => return NotifAction::Errno(libc::EACCES),
+        Err(crate::error::BranchError::MetaApply) => return NotifAction::Errno(libc::EIO),
+        Err(_) => return NotifAction::Continue,
     };
     let times_raw = times.as_ref().map(|t| t.as_ptr()).unwrap_or(std::ptr::null());
-    let follow = (flags & libc::AT_SYMLINK_NOFOLLOW) == 0;
-    if let Err(e) = crate::sys::fs::utimensat_in_root(root, &rel, times_raw, follow) {
+    if let Err(e) = crate::sys::fs::utimensat_in_root(&upper_root, &target, times_raw, false) {
+        return NotifAction::Errno(e);
+    }
+    NotifAction::ReturnValue(0)
+}
+
+// ============================================================
+// Metadata on a descriptor, and path-based xattr / legacy time
+// ============================================================
+
+/// What a metadata op's child-supplied path really names, after expanding the
+/// `/proc`/`/dev/fd` magic-link namespace as the child sees it. Classifying by
+/// the literal string is unsound: `/proc/self/root/<ws>`, `/proc/self/cwd/…`,
+/// `/proc/<pid>/root/…`, `/proc/thread-self/…`, `/proc/self/fd/N`,
+/// `/proc/<pid>/task/<tid>/fd/N` and `/dev/fd/N` all resolve, in the child's
+/// view, to a real inode that can be a lower workspace file — but their
+/// literal path is not under the workdir, so a string check sees "outside"
+/// and the kernel applies the change to the real file (ADR-0012 Update 8).
+enum MetaPath {
+    /// A plain real path (no remaining magic). The caller runs the normal
+    /// workspace classification on it.
+    Path(String),
+    /// The op names a descriptor; gate it like the fd route.
+    Fd { pid: u32, fd: i64 },
+    /// A `/proc` magic component we cannot resolve to a real target: fail
+    /// closed rather than let it through.
+    Refuse,
+}
+
+/// Expand the `/proc`/`/dev/fd` magic links in a child-supplied absolute path
+/// to the real target the child's syscall would hit. `self`/`thread-self` map
+/// to the child; `root`/`cwd`/`fd` are read from the concrete `/proc/<id>/…`
+/// the supervisor can see. Iterates so nested magic (`/proc/self/root/proc/…`)
+/// collapses; a form it cannot expand becomes [`MetaPath::Refuse`].
+fn resolve_child_meta_path(path: &str, child_pid: u32) -> MetaPath {
+    let rl = |p: String| std::fs::read_link(p).ok().and_then(|t| t.to_str().map(str::to_string));
+    let join = |base: String, rest: &str| -> String {
+        if rest.is_empty() { base }
+        else if base == "/" { format!("/{}", rest) }
+        else { format!("{}/{}", base.trim_end_matches('/'), rest) }
+    };
+    let rl_at = |id: u32, name: &str| rl(format!("/proc/{id}/{name}"));
+    let mut cur = path.to_string();
+    for _ in 0..16 {
+        // /dev/fd/N[/rest] == the child's /proc/self/fd/N[/rest].
+        let (tpid, component): (u32, String) = if let Some(r) = cur.strip_prefix("/dev/fd/") {
+            (child_pid, format!("fd/{r}"))
+        } else if let Some(rest) = cur.strip_prefix("/proc/") {
+            let (who, after) = rest.split_once('/').unwrap_or((rest, ""));
+            let base = match who {
+                "self" | "thread-self" => child_pid,
+                n => match n.parse::<u32>() { Ok(p) => p, Err(_) => return MetaPath::Path(cur) },
+            };
+            // /proc/<who>/task/<tid>/<component...> acts on the thread <tid>.
+            if let Some(tr) = after.strip_prefix("task/") {
+                let (tid_s, trest) = tr.split_once('/').unwrap_or((tr, ""));
+                match tid_s.parse::<u32>() { Ok(tid) => (tid, trest.to_string()), Err(_) => return MetaPath::Refuse }
+            } else {
+                (base, after.to_string())
+            }
+        } else {
+            // No remaining magic: a plain real path.
+            return MetaPath::Path(cur);
+        };
+        // `component` is relative to /proc/<tpid>/.
+        if let Some(r) = component.strip_prefix("fd/") {
+            let (n_s, rest) = r.split_once('/').unwrap_or((&r, ""));
+            let fd = match n_s.parse::<i64>() { Ok(n) if n >= 0 => n, _ => return MetaPath::Refuse };
+            if rest.is_empty() {
+                return MetaPath::Fd { pid: tpid, fd };
+            }
+            match rl_at(tpid, &format!("fd/{fd}")) { Some(b) => { cur = join(b, rest); continue } None => return MetaPath::Refuse }
+        }
+        let root_cwd = ["root", "cwd"].into_iter().find_map(|name| {
+            if component == name {
+                Some((name, ""))
+            } else {
+                component.strip_prefix(&format!("{name}/")).map(|rest| (name, rest))
+            }
+        });
+        if let Some((name, rest)) = root_cwd {
+            let rest = rest.to_string();
+            match rl_at(tpid, name) { Some(b) => { cur = join(b, &rest); continue } None => return MetaPath::Refuse }
+        }
+        // A /proc/<pid>/<other> (a real procfs file, map_files, …): not a
+        // workspace alias this handles; leave it to the normal check, which
+        // treats a non-workspace path as the kernel's business.
+        return MetaPath::Path(cur);
+    }
+    MetaPath::Refuse
+}
+
+/// Gate an fd-route metadata op (`fchmod`/`fchown`/`fsetxattr`/`fremovexattr`,
+/// and `utimensat(dirfd, NULL, ...)`). The descriptor's real path says what it
+/// names: an upper entry (a copied-up file, or one the child created) is the
+/// branch's own, so the kernel may apply the change; a descriptor still naming
+/// the lower workspace file is refused with `EPERM`, since Landlock does not
+/// restrict metadata and the change would otherwise land on the real file
+/// (ADR-0012 Update 8). Anything outside the workspace is the child's own
+/// business (ADR-0026 B1) and continues to the kernel.
+async fn gate_cow_fd_metadata(
+    cow_state: &Arc<Mutex<CowState>>,
+    pid: u32,
+    fd: i64,
+) -> NotifAction {
+    if fd < 0 {
+        return NotifAction::Continue;
+    }
+    let (workdir_root, upper_root) = {
+        let st = cow_state.lock().await;
+        match st.branch.as_ref() {
+            Some(c) => (c.workdir().to_path_buf(), c.upper_dir().to_path_buf()),
+            None => return NotifAction::Continue,
+        }
+    };
+    let real = match std::fs::read_link(format!("/proc/{}/fd/{}", pid, fd)) {
+        Ok(p) => p,
+        // Cannot resolve the descriptor (gone, or not a path-backed fd such as
+        // a pipe/socket): nothing of the workspace to protect here.
+        Err(_) => return NotifAction::Continue,
+    };
+    if real.starts_with(&upper_root) {
+        return NotifAction::Continue;
+    }
+    if real.starts_with(&workdir_root) {
+        return NotifAction::Errno(libc::EPERM);
+    }
+    NotifAction::Continue
+}
+
+/// fchmod/fchown/fsetxattr/fremovexattr: the fd is arg 0.
+pub(crate) async fn handle_cow_meta_fd(
+    notif: &SeccompNotif,
+    cow_state: &Arc<Mutex<CowState>>,
+    _processes: &Arc<ProcessIndex>,
+    _notif_fd: RawFd,
+) -> NotifAction {
+    gate_cow_fd_metadata(cow_state, notif.pid, notif.data.args[0] as i64).await
+}
+
+/// setxattr/lsetxattr/removexattr/lremovexattr on a path. Stage the
+/// symlink-resolved target into the upper and apply the xattr change there, so
+/// it never lands on the real lower file.
+pub(crate) async fn handle_cow_setxattr(
+    notif: &SeccompNotif,
+    cow_state: &Arc<Mutex<CowState>>,
+    processes: &Arc<ProcessIndex>,
+    notif_fd: RawFd,
+) -> NotifAction {
+    let nr = notif.data.nr as i64;
+    let (follow, removing) = if nr == libc::SYS_setxattr {
+        (true, false)
+    } else if nr == libc::SYS_lsetxattr {
+        (false, false)
+    } else if nr == libc::SYS_removexattr {
+        (true, true)
+    } else if nr == libc::SYS_lremovexattr {
+        (false, true)
+    } else {
+        return NotifAction::Continue;
+    };
+
+    let virtual_cwd = current_virtual_cwd(processes, notif.pid).await;
+    let raw = match read_path(notif, notif.data.args[0], notif_fd) {
+        Some(p) => p,
+        None => return NotifAction::Continue,
+    };
+    let path = resolve_at_path_with_virtual(notif, libc::AT_FDCWD as i64, &raw, virtual_cwd.as_deref());
+    let path = match resolve_child_meta_path(&path, notif.pid) {
+        MetaPath::Fd { pid, fd } => return gate_cow_fd_metadata(cow_state, pid, fd).await,
+        MetaPath::Refuse => return NotifAction::Errno(libc::EACCES),
+        MetaPath::Path(real) => real,
+    };
+    let name = match read_path(notif, notif.data.args[1], notif_fd) {
+        Some(n) => n,
+        None => return NotifAction::Continue,
+    };
+    let value = if removing {
+        Vec::new()
+    } else {
+        let len = notif.data.args[3] as usize;
+        if len > 64 * 1024 {
+            return NotifAction::Continue; // oversized: leave to the kernel's own EINVAL/E2BIG
+        }
+        match read_child_mem(notif_fd, notif.id, notif.pid, notif.data.args[2], len) {
+            Ok(v) => v,
+            Err(_) => return NotifAction::Errno(libc::EFAULT),
+        }
+    };
+    let flags = notif.data.args[4] as i32;
+
+    let mut st = cow_state.lock().await;
+    let cow = match st.branch.as_mut() {
+        Some(c) => c,
+        None => return NotifAction::Continue,
+    };
+    let path = map_cow_upper_path(cow, &path);
+    if !cow.matches(&path) {
+        return NotifAction::Continue;
+    }
+    let op = if removing {
+        crate::cow::seccomp::XattrApply::Remove { name: &name }
+    } else {
+        crate::cow::seccomp::XattrApply::Set { name: &name, value: &value, flags }
+    };
+    match cow.handle_xattr(&path, follow, op) {
+        Ok(true) => NotifAction::ReturnValue(0),
+        Ok(false) => NotifAction::Continue,
+        Err(crate::error::BranchError::QuotaExceeded) => NotifAction::Errno(libc::ENOSPC),
+        Err(crate::error::BranchError::NotGranted)
+        | Err(crate::error::BranchError::Escapes) => NotifAction::Errno(libc::EACCES),
+        Err(crate::error::BranchError::MetaApply) => NotifAction::Errno(libc::EIO),
+        Err(_) => NotifAction::Continue,
+    }
+}
+
+/// Legacy time ops: `utimes(path, timeval[2])` and
+/// `futimesat(dirfd, path, timeval[2])`. Stage the target and stamp it in the
+/// upper, like `utimensat`. A NULL path on `futimesat` names the directory fd.
+pub(crate) async fn handle_cow_utimes(
+    notif: &SeccompNotif,
+    cow_state: &Arc<Mutex<CowState>>,
+    processes: &Arc<ProcessIndex>,
+    notif_fd: RawFd,
+) -> NotifAction {
+    let nr = notif.data.nr as i64;
+    // utime(path, utimbuf*): two time_t (actime, modtime), no sub-second part.
+    let is_utime = Some(nr) == arch::sys_utime();
+    let (dirfd, path_ptr, times_ptr) = if Some(nr) == arch::sys_futimesat() {
+        (notif.data.args[0] as i64, notif.data.args[1], notif.data.args[2])
+    } else {
+        (libc::AT_FDCWD as i64, notif.data.args[0], notif.data.args[1])
+    };
+    if path_ptr == 0 {
+        return gate_cow_fd_metadata(cow_state, notif.pid, dirfd).await;
+    }
+
+    let virtual_cwd = current_virtual_cwd(processes, notif.pid).await;
+    let path = match read_path(notif, path_ptr, notif_fd) {
+        Some(p) => resolve_at_path_with_virtual(notif, dirfd, &p, virtual_cwd.as_deref()),
+        None => return NotifAction::Continue,
+    };
+    let path = match resolve_child_meta_path(&path, notif.pid) {
+        MetaPath::Fd { pid, fd } => return gate_cow_fd_metadata(cow_state, pid, fd).await,
+        MetaPath::Refuse => return NotifAction::Errno(libc::EACCES),
+        MetaPath::Path(real) => real,
+    };
+
+    // Build timespec[2]; a NULL times pointer means "now".
+    let times = if times_ptr == 0 {
+        None
+    } else if is_utime {
+        match read_child_mem(notif_fd, notif.id, notif.pid, times_ptr, 16) {
+            Ok(data) => {
+                let mut buf: [i64; 2] = [0; 2];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(data.as_ptr(), &mut buf as *mut _ as *mut u8, 16);
+                }
+                Some([
+                    libc::timespec { tv_sec: buf[0] as libc::time_t, tv_nsec: 0 },
+                    libc::timespec { tv_sec: buf[1] as libc::time_t, tv_nsec: 0 },
+                ])
+            }
+            Err(_) => return NotifAction::Errno(libc::EFAULT),
+        }
+    } else {
+        // utimes/futimesat: timeval[2] -> timespec[2].
+        match read_child_mem(notif_fd, notif.id, notif.pid, times_ptr, 32) {
+            Ok(data) => {
+                let mut tv: [libc::timeval; 2] = unsafe { std::mem::zeroed() };
+                unsafe {
+                    std::ptr::copy_nonoverlapping(data.as_ptr(), &mut tv as *mut _ as *mut u8, 32);
+                }
+                Some([
+                    libc::timespec { tv_sec: tv[0].tv_sec, tv_nsec: (tv[0].tv_usec as i64) * 1000 },
+                    libc::timespec { tv_sec: tv[1].tv_sec, tv_nsec: (tv[1].tv_usec as i64) * 1000 },
+                ])
+            }
+            Err(_) => return NotifAction::Errno(libc::EFAULT),
+        }
+    };
+
+    let mut st = cow_state.lock().await;
+    let cow = match st.branch.as_mut() {
+        Some(c) => c,
+        None => return NotifAction::Continue,
+    };
+    let upper_root = cow.upper_dir().to_path_buf();
+    let path = map_cow_upper_path(cow, &path);
+    if !cow.matches(&path) {
+        return NotifAction::Continue;
+    }
+    // utimes/futimesat follow symlinks (no AT_SYMLINK_NOFOLLOW form).
+    let target = match cow.handle_utimensat(&path, true) {
+        Ok(Some(t)) => t,
+        Ok(None) => return NotifAction::Continue,
+        Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
+        Err(crate::error::BranchError::NotGranted)
+        | Err(crate::error::BranchError::Escapes) => return NotifAction::Errno(libc::EACCES),
+        Err(crate::error::BranchError::MetaApply) => return NotifAction::Errno(libc::EIO),
+        Err(_) => return NotifAction::Continue,
+    };
+    let times_raw = times.as_ref().map(|t| t.as_ptr()).unwrap_or(std::ptr::null());
+    if let Err(e) = crate::sys::fs::utimensat_in_root(&upper_root, &target, times_raw, false) {
         return NotifAction::Errno(e);
     }
     NotifAction::ReturnValue(0)

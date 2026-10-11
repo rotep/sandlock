@@ -30,6 +30,35 @@ fn parent_rel(rel: &str) -> Option<&str> {
     rel.trim_end_matches('/').rfind('/').map(|i| &rel[..i])
 }
 
+/// Join a symlink target to the directory it sits in and normalise `.`/`..`
+/// lexically, confined to the workspace root. Returns `None` when the target
+/// is absolute or climbs above the root — the symlink would leave the
+/// workspace, which a metadata op must refuse rather than follow. The result
+/// is a clean workspace-relative path (no `.`/`..`, no leading/trailing `/`).
+fn join_rel_confined(dir: Option<&str>, target: &str) -> Option<String> {
+    if target.starts_with('/') {
+        return None; // absolute symlink: leaves the workspace
+    }
+    let mut stack: Vec<&str> = Vec::new();
+    if let Some(d) = dir {
+        for c in d.split('/').filter(|c| !c.is_empty() && *c != ".") {
+            stack.push(c);
+        }
+    }
+    for c in target.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                if stack.pop().is_none() {
+                    return None; // climbs above the workspace root
+                }
+            }
+            other => stack.push(other),
+        }
+    }
+    Some(stack.join("/"))
+}
+
 /// Errno for a branch failure, for handlers that answer the child directly
 /// (the `handle_unlink` convention) rather than returning a `BranchError`.
 fn branch_errno(e: BranchError) -> i32 {
@@ -41,7 +70,8 @@ fn branch_errno(e: BranchError) -> i32 {
         // A kernel object cannot be staged in the upper; EXDEV makes mv and
         // ln fall back to mknod plus unlink, which the branch virtualizes.
         BranchError::NotOwned => libc::EXDEV,
-        BranchError::NotGranted => libc::EACCES,
+        BranchError::NotGranted | BranchError::Escapes => libc::EACCES,
+        BranchError::MetaApply => libc::EIO,
         BranchError::Operation(_) | BranchError::Conflict(_) => libc::EIO,
     }
 }
@@ -58,6 +88,14 @@ pub enum CowCopyPlan {
         lower: PathBuf,
         file_size: u64,
     },
+}
+
+/// The xattr change a path-based `setxattr`/`removexattr` carries, handed to
+/// [`SeccompCowBranch::handle_xattr`] so it stages the target and applies the
+/// change to the upper copy.
+pub enum XattrApply<'a> {
+    Set { name: &'a str, value: &'a [u8], flags: i32 },
+    Remove { name: &'a str },
 }
 
 /// Plan returned by `prepare_open` — describes what I/O to do after releasing the lock.
@@ -1841,13 +1879,78 @@ impl SeccompCowBranch {
     /// Handle fchmodat.
     ///
     /// Returns `Err(QuotaExceeded)` when the COW copy would exceed `max_disk`.
+    /// The workspace-relative target a metadata op (which follows symlinks)
+    /// must act on, resolved in the merged view (upper over lower) and
+    /// confined to the workspace. A symlink whose target leaves the workspace
+    /// (absolute, or `..` above the root) is [`BranchError::Escapes`] — the
+    /// op must not reach outside through it. With `follow` false the op acts
+    /// on the entry itself (e.g. `AT_SYMLINK_NOFOLLOW`), so `rel` is returned
+    /// unchanged and a symlink is stamped in place in the upper.
+    fn resolve_meta_target(&self, rel: &str, follow: bool) -> Result<String, BranchError> {
+        if !follow {
+            return Ok(rel.to_string());
+        }
+        let mut cur = rel.to_string();
+        for _ in 0..40 {
+            // lstat in the merged view: upper shadows lower.
+            let st = match crate::sys::fs::statat_in_root(&self.upper, &cur, false) {
+                Ok(st) => st,
+                Err(_) => match crate::sys::fs::statat_in_root(&self.workdir, &cur, false) {
+                    Ok(st) => st,
+                    // Nothing there to follow: let the caller's copy-up/apply
+                    // produce the kernel's own answer for a missing entry.
+                    Err(_) => return Ok(cur),
+                },
+            };
+            if st.st_mode & libc::S_IFMT != libc::S_IFLNK {
+                return Ok(cur);
+            }
+            let target = crate::sys::fs::readlink_in_root(&self.upper, &cur)
+                .or_else(|_| crate::sys::fs::readlink_in_root(&self.workdir, &cur))
+                .map_err(|_| BranchError::Escapes)?;
+            let target = String::from_utf8_lossy(&target).into_owned();
+            cur = join_rel_confined(parent_rel(&cur), &target).ok_or(BranchError::Escapes)?;
+        }
+        Err(BranchError::Escapes)
+    }
+
+    /// Copy the symlink-resolved target up (the read gate applies, so an
+    /// ungranted target is refused) and hand back its workspace-relative path,
+    /// now a regular entry in the upper. `follow` is the op's symlink
+    /// semantics. Any copy-up failure that is not a gate or escape refusal
+    /// becomes [`BranchError::MetaApply`], so the caller answers an errno
+    /// rather than falling through to the kernel.
+    fn stage_meta_target(&mut self, rel: &str, follow: bool) -> Result<String, BranchError> {
+        let target = self.resolve_meta_target(rel, follow)?;
+        match self.ensure_cow_copy(&target) {
+            Ok(_) => Ok(target),
+            // Gate/escape/quota keep their own errno; a kernel object or a
+            // whiteout keeps its (the caller's existing dispositions). Only a
+            // genuine copy/apply failure becomes MetaApply, so the caller
+            // answers an errno instead of falling through to the kernel.
+            Err(e @ (BranchError::NotGranted
+                | BranchError::Escapes
+                | BranchError::QuotaExceeded
+                | BranchError::NotOwned
+                | BranchError::Deleted)) => Err(e),
+            Err(_) => Err(BranchError::MetaApply),
+        }
+    }
+
     pub fn handle_chmod(&mut self, path: &str, mode: u32) -> Result<bool, BranchError> {
         let rel = match self.safe_rel(path) {
             Some(r) => r,
             None => return Ok(false),
         };
-        let _ = self.ensure_cow_copy(&rel)?;
-        Ok(crate::sys::fs::chmod_in_root(&self.upper, &rel, mode).is_ok())
+        // Follow the symlink in the merged view and copy the real target up,
+        // then chmod that regular entry in the upper. The old code copied the
+        // symlink verbatim and chmod'd it in the upper, where the target does
+        // not exist, so the apply failed and the caller fell through to the
+        // kernel, which chmod'd the real lower target (ADR-0012 Update 8).
+        let target = self.stage_meta_target(&rel, true)?;
+        crate::sys::fs::chmod_in_root(&self.upper, &target, mode)
+            .map_err(|_| BranchError::MetaApply)?;
+        Ok(true)
     }
 
     /// Handle fchownat.
@@ -1858,11 +1961,13 @@ impl SeccompCowBranch {
             Some(r) => r,
             None => return Ok(false),
         };
-        let _ = self.ensure_cow_copy(&rel)?;
-        // Best-effort: try the real chown but succeed either way — the
-        // supervisor typically lacks CAP_CHOWN so this will fail, but
-        // in COW/dry-run mode the ownership doesn't matter.
-        let _ = crate::sys::fs::chown_in_root(&self.upper, &rel, uid, gid);
+        // Resolve+stage the target so a symlink cannot carry the chown to the
+        // real lower file, and a copy-up failure answers an errno rather than
+        // the caller falling through to the kernel.
+        let target = self.stage_meta_target(&rel, true)?;
+        // Best-effort: the supervisor typically lacks CAP_CHOWN so the real
+        // chown fails, but in COW/dry-run mode the ownership does not matter.
+        let _ = crate::sys::fs::chown_in_root(&self.upper, &target, uid, gid);
         Ok(true)
     }
 
@@ -1875,19 +1980,24 @@ impl SeccompCowBranch {
             None => return Ok(false),
         };
         let new_len = length as u64;
-        let _ = self.ensure_cow_copy(&rel)?;
-        let old_len = crate::sys::fs::statat_in_root(&self.upper, &rel, true)
+        // truncate follows symlinks: stage the real target so a symlink cannot
+        // carry the resize to the real lower file, and a copy-up failure
+        // answers an errno rather than the caller falling through to the
+        // kernel (which would truncate the lower target, ADR-0012 Update 8).
+        let rel = self.stage_meta_target(&rel, true)?;
+        let rel = rel.as_str();
+        let old_len = crate::sys::fs::statat_in_root(&self.upper, rel, true)
             .map(|st| st.st_size as u64)
             .unwrap_or(0);
         if new_len > old_len {
             self.check_quota(new_len - old_len)?;
         }
         let fd = match crate::sys::fs::openat2_in_root(
-            &self.upper, &rel,
+            &self.upper, rel,
             libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC, 0,
         ) {
             Ok(fd) => fd,
-            Err(_) => return Ok(false),
+            Err(_) => return Err(BranchError::MetaApply),
         };
         let ok = unsafe { libc::ftruncate(fd, new_len as libc::off_t) } == 0;
         unsafe { libc::close(fd) };
@@ -1903,13 +2013,41 @@ impl SeccompCowBranch {
 
     /// Handle utimensat — resolve to upper, return the upper path for the
     /// caller to call utimensat on.
-    pub fn handle_utimensat(&mut self, path: &str) -> Result<Option<PathBuf>, BranchError> {
+    /// Stage the target of a `utimensat`/`utimes`/`futimesat` for stamping.
+    /// Returns the workspace-relative target (a regular entry in the upper
+    /// when `follow`, the symlink itself when not); the caller stamps it in
+    /// the upper with `AT_SYMLINK_NOFOLLOW`. `follow` is the op's symlink
+    /// semantics. A copy-up failure answers an errno, never `Continue` —
+    /// `utimensat` is not restricted by Landlock (ADR-0012 Update 8).
+    pub fn handle_utimensat(&mut self, path: &str, follow: bool) -> Result<Option<String>, BranchError> {
         let rel = match self.safe_rel(path) {
             Some(r) => r,
             None => return Ok(None),
         };
-        let upper = self.ensure_cow_copy(&rel)?;
-        Ok(Some(upper))
+        Ok(Some(self.stage_meta_target(&rel, follow)?))
+    }
+
+    /// Stage the target of a path-based `setxattr`/`removexattr` (and their
+    /// `l*` no-follow variants) and apply `op` to the upper copy, so the xattr
+    /// change lands in the branch and never on the real lower file. The read
+    /// gate applies to the copy-up, so an ungranted target is refused.
+    pub fn handle_xattr(&mut self, path: &str, follow: bool, op: XattrApply<'_>) -> Result<bool, BranchError> {
+        let rel = match self.safe_rel(path) {
+            Some(r) => r,
+            None => return Ok(false),
+        };
+        let target = self.stage_meta_target(&rel, follow)?;
+        match op {
+            XattrApply::Set { name, value, flags } => {
+                crate::sys::fs::setxattr_in_root(&self.upper, &target, name, value, flags, follow)
+                    .map_err(|_| BranchError::MetaApply)?;
+            }
+            XattrApply::Remove { name } => {
+                crate::sys::fs::removexattr_in_root(&self.upper, &target, name, follow)
+                    .map_err(|_| BranchError::MetaApply)?;
+            }
+        }
+        Ok(true)
     }
 
     /// Handle readlink.
@@ -5059,6 +5197,50 @@ mod tests {
     }
 
     #[test]
+    fn join_rel_confined_normalises_and_refuses_escapes() {
+        // Relative, in-workspace joins normalise `.`/`..`.
+        assert_eq!(join_rel_confined(Some("pub"), "../private/s.txt").as_deref(), Some("private/s.txt"));
+        assert_eq!(join_rel_confined(Some("a/b"), "./c").as_deref(), Some("a/b/c"));
+        assert_eq!(join_rel_confined(Some("a/b"), "../../x").as_deref(), Some("x"));
+        // An absolute symlink leaves the workspace.
+        assert_eq!(join_rel_confined(Some("pub"), "/etc/passwd"), None);
+        // Climbing above the workspace root is refused.
+        assert_eq!(join_rel_confined(Some("pub"), "../../outside"), None);
+        assert_eq!(join_rel_confined(None, ".."), None);
+    }
+
+    #[test]
+    fn resolve_meta_target_follows_symlinks_confined() {
+        let (_w, _s, wd, branch) = gated_branch();
+        // pub/lnk -> ../private/secret.txt resolves to the workspace target.
+        std::os::unix::fs::symlink(wd.join("private/secret.txt"), wd.join("pub/by_abs")).unwrap();
+        std::os::unix::fs::symlink("../private/secret.txt", wd.join("pub/by_rel")).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", wd.join("pub/to_abs")).unwrap();
+        // A relative symlink stays in the workspace and resolves.
+        assert_eq!(branch.resolve_meta_target("pub/by_rel", true).unwrap(), "private/secret.txt");
+        // An absolute symlink (even to a workspace path) is treated as leaving
+        // the workspace: the real fs would follow it out of the sandbox view.
+        assert!(matches!(branch.resolve_meta_target("pub/by_abs", true), Err(BranchError::Escapes)));
+        assert!(matches!(branch.resolve_meta_target("pub/to_abs", true), Err(BranchError::Escapes)));
+        // A non-symlink resolves to itself; no-follow never rewrites.
+        assert_eq!(branch.resolve_meta_target("pub/readme.txt", true).unwrap(), "pub/readme.txt");
+        assert_eq!(branch.resolve_meta_target("pub/by_rel", false).unwrap(), "pub/by_rel");
+    }
+
+    #[test]
+    fn chmod_through_a_symlink_to_an_ungranted_target_is_refused() {
+        let (_w, _s, wd, mut branch) = gated_branch();
+        fs::set_permissions(wd.join("private/secret.txt"), <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink("../private/secret.txt", wd.join("pub/lnk")).unwrap();
+        // chmod follows the symlink to private/, which no grant covers.
+        let p = format!("{}/pub/lnk", wd.display());
+        assert!(matches!(branch.handle_chmod(&p, 0o644), Err(BranchError::NotGranted)));
+        // The real target is untouched: the refusal never reached chmod.
+        assert_eq!(std::os::unix::fs::MetadataExt::mode(&fs::metadata(wd.join("private/secret.txt")).unwrap()) & 0o777, 0o600);
+        assert!(!branch.upper_dir().join("private/secret.txt").exists());
+    }
+
+    #[test]
     fn read_gate_lists_lower_names_only_from_the_judged_directory() {
         let (_w, _s, wd, mut branch) = gated_branch();
         std::os::unix::fs::symlink(wd.join("private"), wd.join("pub/lnk")).unwrap();
@@ -5531,7 +5713,7 @@ mod tests {
         let storage = tempfile::tempdir().unwrap();
         let mut branch = SeccompCowBranch::create(Path::new("/"), Some(storage.path()), 0).unwrap();
         assert!(matches!(branch.handle_chmod("/dev/null", 0o666), Err(BranchError::NotOwned)));
-        assert!(matches!(branch.handle_utimensat("/dev/null"), Err(BranchError::NotOwned)));
+        assert!(matches!(branch.handle_utimensat("/dev/null", true), Err(BranchError::NotOwned)));
         assert_eq!(branch.handle_open("/dev/null", libc::O_RDWR as u64).unwrap(), None);
         assert!(!branch.upper_dir().join("dev/null").exists());
     }
